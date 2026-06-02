@@ -367,6 +367,9 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/movies/", s.handleMovieByID)
 	mux.HandleFunc("/api/v1/series", s.handleSeries)
 	mux.HandleFunc("/api/v1/series/", s.handleSeriesByID)
+	mux.HandleFunc("/api/v1/stats", s.handleStats)
+	mux.HandleFunc("/api/v1/channels", s.handleEmptyList)
+	mux.HandleFunc("/api/v1/channels/", s.handleEmptyList)
 	mux.HandleFunc("/api/v1/discover/trending", s.handleDiscoverList)
 	mux.HandleFunc("/api/v1/discover/popular", s.handleDiscoverList)
 	mux.HandleFunc("/api/v1/vortexo/capabilities", s.handleCapabilities)
@@ -404,6 +407,14 @@ func (s *appState) load() error {
 	if s.config.Manifests == nil {
 		s.config.Manifests = []installedManifest{}
 		changed = true
+	}
+	for i := range s.config.Manifests {
+		normalized := normalizeManifestURL(s.config.Manifests[i].URL)
+		if normalized != "" && normalized != s.config.Manifests[i].URL {
+			s.config.Manifests[i].URL = normalized
+			s.config.Manifests[i].UpdatedAt = time.Now().UTC()
+			changed = true
+		}
 	}
 	if changed {
 		return s.saveLocked()
@@ -757,6 +768,26 @@ func (s *appState) handleDiscoverList(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]any{"items": []any{}})
 }
 
+func (s *appState) handleEmptyList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"items": []any{}, "channels": []any{}})
+}
+
+func (s *appState) handleStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{
+		"total_movies":   0,
+		"total_series":   0,
+		"total_episodes": 0,
+	})
+}
+
 func (s *appState) handleVortexoHome(w http.ResponseWriter, r *http.Request) {
 	rowLimit := boundedInt(r.URL.Query().Get("row_limit"), 8, 1, 12)
 	itemLimit := boundedInt(r.URL.Query().Get("item_limit"), 30, 6, 50)
@@ -1093,6 +1124,9 @@ func (s *appState) fetchCatalog(ctx context.Context, base string, catalog stremi
 	if len(items) == 0 {
 		items = response.Items
 	}
+	for i := range items {
+		items[i] = canonicalStremioMeta(items[i], "", catalog.Type)
+	}
 	if limit > 0 && len(items) > limit {
 		items = items[:limit]
 	}
@@ -1124,6 +1158,7 @@ func (s *appState) findManifestMeta(ctx context.Context, mediaType, id string) (
 			lastErr = err
 			continue
 		}
+		meta = canonicalStremioMeta(meta, id, stremioType)
 		if strings.TrimSpace(meta.ID) != "" || strings.TrimSpace(meta.Name) != "" {
 			return meta, nil
 		}
@@ -1142,13 +1177,13 @@ func (s *appState) fetchMeta(ctx context.Context, base string, mediaType string,
 		return stremioMeta{}, err
 	}
 	if strings.TrimSpace(response.Meta.ID) != "" || strings.TrimSpace(response.Meta.Name) != "" {
-		return response.Meta, nil
+		return canonicalStremioMeta(response.Meta, id, mediaType), nil
 	}
 	if len(response.Metas) > 0 {
-		return response.Metas[0], nil
+		return canonicalStremioMeta(response.Metas[0], id, mediaType), nil
 	}
 	if len(response.Items) > 0 {
-		return response.Items[0], nil
+		return canonicalStremioMeta(response.Items[0], id, mediaType), nil
 	}
 	return stremioMeta{}, fmt.Errorf("empty meta response")
 }
@@ -1675,6 +1710,21 @@ func findMessage(value any) string {
 	return ""
 }
 
+func canonicalStremioMeta(meta stremioMeta, requestedID string, fallbackType string) stremioMeta {
+	requestedIMDBID := imdbFromID(requestedID)
+	metaIMDBID := firstNonEmpty(meta.IMDBID, imdbFromID(meta.ID), requestedIMDBID)
+	if metaIMDBID != "" {
+		meta.IMDBID = metaIMDBID
+		meta.ID = metaIMDBID
+	}
+	if strings.TrimSpace(meta.Type) == "" {
+		if normalized := normalizeStremioType(fallbackType); normalized != "" {
+			meta.Type = normalized
+		}
+	}
+	return meta
+}
+
 func homeItemFromStremio(meta stremioMeta, fallbackType string) vortexoHomeItem {
 	mediaType := normalizeCatalogType(firstNonEmpty(meta.Type, fallbackType))
 	title := firstNonEmpty(meta.Name, meta.Title, "Untitled")
@@ -1690,7 +1740,7 @@ func homeItemFromStremio(meta stremioMeta, fallbackType string) vortexoHomeItem 
 	if mediaType == "tv" {
 		firstAirDate = dateFromText(firstNonEmpty(meta.FirstAired, meta.ReleaseInfo))
 	}
-	id := firstNonEmpty(meta.ID, imdbID, slug(title+"-"+strconv.Itoa(year)))
+	id := firstNonEmpty(imdbID, meta.ID, slug(title+"-"+strconv.Itoa(year)))
 	guid := ""
 	if tmdbID > 0 {
 		guid = "tmdb://" + mediaType + "/" + strconv.Itoa(tmdbID)
@@ -1756,7 +1806,7 @@ func manifestEpisodesFromStremio(meta stremioMeta) []vortexoManifestEpisode {
 	}
 
 	now := time.Now().Unix()
-	seriesID := firstNonEmpty(meta.ID, meta.IMDBID, imdbFromID(meta.ID), slug(firstNonEmpty(meta.Name, meta.Title)))
+	seriesID := firstNonEmpty(meta.IMDBID, imdbFromID(meta.ID), meta.ID, slug(firstNonEmpty(meta.Name, meta.Title)))
 	defaultStill := firstNonEmpty(meta.Background, meta.Poster)
 	defaultRuntime := runtimeMinutes(meta.Runtime)
 	defaultVote := floatFromText(meta.IMDBRating)
@@ -1989,10 +2039,20 @@ func normalizeManifestURL(raw string) string {
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return ""
 	}
+	parsed.Host = canonicalManifestHost(parsed.Host)
 	if !strings.HasSuffix(strings.ToLower(strings.TrimRight(parsed.Path, "/")), "/manifest.json") {
 		parsed.Path = strings.TrimRight(parsed.Path, "/") + "/manifest.json"
 	}
 	return parsed.String()
+}
+
+func canonicalManifestHost(host string) string {
+	switch strings.ToLower(strings.TrimSpace(host)) {
+	case "cinemeta-v3.strem.io":
+		return "v3-cinemeta.strem.io"
+	default:
+		return host
+	}
 }
 
 func normalizeStremioType(value string) string {
