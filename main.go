@@ -136,29 +136,51 @@ type stremioCatalogResponse struct {
 	Items []stremioMeta `json:"items"`
 }
 
+type stremioMetaResponse struct {
+	Meta  stremioMeta   `json:"meta"`
+	Metas []stremioMeta `json:"metas"`
+	Items []stremioMeta `json:"items"`
+}
+
 type stremioMeta struct {
-	ID            string   `json:"id"`
-	Type          string   `json:"type"`
-	Name          string   `json:"name"`
-	Title         string   `json:"title"`
-	Description   string   `json:"description"`
-	Poster        string   `json:"poster"`
-	PosterShape   string   `json:"posterShape"`
-	Background    string   `json:"background"`
-	Logo          string   `json:"logo"`
-	ReleaseInfo   string   `json:"releaseInfo"`
-	Year          any      `json:"year"`
-	Genres        []string `json:"genres"`
-	IMDBRating    string   `json:"imdbRating"`
-	Runtime       string   `json:"runtime"`
-	TMDBID        any      `json:"tmdb_id"`
-	IMDBID        string   `json:"imdb_id"`
-	OriginalTitle string   `json:"originalTitle"`
-	OriginalName  string   `json:"originalName"`
-	Released      string   `json:"released"`
-	FirstAired    string   `json:"firstAired"`
-	BehaviorHints any      `json:"behaviorHints"`
-	Videos        []any    `json:"videos"`
+	ID            string         `json:"id"`
+	Type          string         `json:"type"`
+	Name          string         `json:"name"`
+	Title         string         `json:"title"`
+	Description   string         `json:"description"`
+	Poster        string         `json:"poster"`
+	PosterShape   string         `json:"posterShape"`
+	Background    string         `json:"background"`
+	Logo          string         `json:"logo"`
+	ReleaseInfo   string         `json:"releaseInfo"`
+	Year          any            `json:"year"`
+	Genres        []string       `json:"genres"`
+	IMDBRating    string         `json:"imdbRating"`
+	Runtime       string         `json:"runtime"`
+	TMDBID        any            `json:"tmdb_id"`
+	IMDBID        string         `json:"imdb_id"`
+	OriginalTitle string         `json:"originalTitle"`
+	OriginalName  string         `json:"originalName"`
+	Released      string         `json:"released"`
+	FirstAired    string         `json:"firstAired"`
+	BehaviorHints any            `json:"behaviorHints"`
+	Videos        []stremioVideo `json:"videos"`
+}
+
+type stremioVideo struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Name        string `json:"name"`
+	Overview    string `json:"overview"`
+	Description string `json:"description"`
+	Thumbnail   string `json:"thumbnail"`
+	Poster      string `json:"poster"`
+	Released    string `json:"released"`
+	FirstAired  string `json:"firstAired"`
+	Runtime     string `json:"runtime"`
+	TMDBID      any    `json:"tmdb_id"`
+	Season      any    `json:"season"`
+	Episode     any    `json:"episode"`
 }
 
 type stremioStreamResponse struct {
@@ -221,6 +243,40 @@ type vortexoHomeItem struct {
 	FirstAirDate     string   `json:"first_air_date,omitempty"`
 	AddedAt          int64    `json:"added_at,omitempty"`
 	UpdatedAt        int64    `json:"updated_at,omitempty"`
+}
+
+type vortexoManifestDetail struct {
+	vortexoHomeItem
+	NumberOfSeasons  int                      `json:"number_of_seasons,omitempty"`
+	NumberOfEpisodes int                      `json:"number_of_episodes,omitempty"`
+	Metadata         *vortexoManifestMetadata `json:"metadata,omitempty"`
+}
+
+type vortexoManifestMetadata struct {
+	IMDBID           string   `json:"imdb_id,omitempty"`
+	ReleaseDate      string   `json:"release_date,omitempty"`
+	FirstAirDate     string   `json:"first_air_date,omitempty"`
+	OriginalLanguage string   `json:"original_language,omitempty"`
+	NumberOfSeasons  int      `json:"number_of_seasons,omitempty"`
+	NumberOfEpisodes int      `json:"number_of_episodes,omitempty"`
+	Status           string   `json:"status,omitempty"`
+	Tagline          string   `json:"tagline,omitempty"`
+	OriginCountry    []string `json:"origin_country,omitempty"`
+}
+
+type vortexoManifestEpisode struct {
+	ID            string  `json:"id"`
+	TMDBID        int     `json:"tmdb_id,omitempty"`
+	Title         string  `json:"title"`
+	Overview      string  `json:"overview,omitempty"`
+	StillPath     string  `json:"still_path,omitempty"`
+	SeasonNumber  int     `json:"season_number"`
+	EpisodeNumber int     `json:"episode_number,omitempty"`
+	Runtime       int     `json:"runtime,omitempty"`
+	AirDate       string  `json:"air_date,omitempty"`
+	VoteAverage   float64 `json:"vote_average,omitempty"`
+	AddedAt       int64   `json:"added_at,omitempty"`
+	UpdatedAt     int64   `json:"updated_at,omitempty"`
 }
 
 type vortexoSourcesRequest struct {
@@ -307,6 +363,8 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/bridge/perfect-setup", s.requireAuth(s.handlePerfectSetup))
 	mux.HandleFunc("/api/v1/bridge/manifests", s.requireAuth(s.handleManifests))
 	mux.HandleFunc("/api/v1/bridge/manifests/", s.requireAuth(s.handleManifestByID))
+	mux.HandleFunc("/api/v1/movies/", s.requireAuth(s.handleMovieByID))
+	mux.HandleFunc("/api/v1/series/", s.requireAuth(s.handleSeriesByID))
 	mux.HandleFunc("/api/v1/vortexo/capabilities", s.handleCapabilities)
 	mux.HandleFunc("/api/v1/vortexo/home", s.handleVortexoHome)
 	mux.HandleFunc("/api/v1/vortexo/sources", s.handleVortexoSources)
@@ -461,9 +519,12 @@ func (s *appState) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 		"home":                 true,
 		"source_api":           true,
 		"playback":             true,
+		"metadata":             true,
+		"seasons":              true,
+		"episodes":             true,
 		"manifest_bridge":      true,
 		"requires_app_changes": false,
-		"types":                []string{"movie", "episode"},
+		"types":                []string{"movie", "show", "season", "episode"},
 	})
 }
 
@@ -724,6 +785,62 @@ func (s *appState) handleVortexoHome(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *appState) handleMovieByID(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	id, tail, ok := splitAPIIDTail(r.URL.Path, "/api/v1/movies/")
+	if !ok || id == "" {
+		respondError(w, http.StatusNotFound, "movie not found")
+		return
+	}
+	if tail == "videos" {
+		respondJSON(w, http.StatusOK, map[string]any{"videos": []any{}})
+		return
+	}
+	if tail != "" {
+		respondError(w, http.StatusNotFound, "movie endpoint not found")
+		return
+	}
+
+	meta, err := s.findManifestMeta(r.Context(), "movie", id)
+	if err != nil {
+		respondError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"movie": manifestDetailFromStremio(meta, "movie")})
+}
+
+func (s *appState) handleSeriesByID(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	id, tail, ok := splitAPIIDTail(r.URL.Path, "/api/v1/series/")
+	if !ok || id == "" {
+		respondError(w, http.StatusNotFound, "series not found")
+		return
+	}
+
+	meta, err := s.findManifestMeta(r.Context(), "series", id)
+	if err != nil {
+		respondError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	switch tail {
+	case "":
+		respondJSON(w, http.StatusOK, map[string]any{"series": manifestDetailFromStremio(meta, "series")})
+	case "episodes":
+		respondJSON(w, http.StatusOK, map[string]any{"episodes": manifestEpisodesFromStremio(meta)})
+	case "videos":
+		respondJSON(w, http.StatusOK, map[string]any{"videos": []any{}})
+	default:
+		respondError(w, http.StatusNotFound, "series endpoint not found")
+	}
+}
+
 func (s *appState) handleVortexoSources(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -854,6 +971,60 @@ func (s *appState) fetchCatalog(ctx context.Context, base string, catalog stremi
 		items = items[:limit]
 	}
 	return items, nil
+}
+
+func (s *appState) findManifestMeta(ctx context.Context, mediaType, id string) (stremioMeta, error) {
+	stremioType := normalizeStremioType(mediaType)
+	if stremioType == "" {
+		return stremioMeta{}, fmt.Errorf("unsupported media type")
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return stremioMeta{}, fmt.Errorf("missing media id")
+	}
+
+	var lastErr error
+	for _, item := range s.enabledManifests() {
+		manifest, base, err := s.fetchManifest(ctx, item.URL, false)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if !manifestSupportsResource(manifest, "meta") || !manifestSupportsType(manifest, stremioType) {
+			continue
+		}
+		meta, err := s.fetchMeta(ctx, base, stremioType, id)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if strings.TrimSpace(meta.ID) != "" || strings.TrimSpace(meta.Name) != "" {
+			return meta, nil
+		}
+	}
+
+	if lastErr != nil {
+		return stremioMeta{}, fmt.Errorf("manifest metadata not found: %w", lastErr)
+	}
+	return stremioMeta{}, fmt.Errorf("manifest metadata not found")
+}
+
+func (s *appState) fetchMeta(ctx context.Context, base string, mediaType string, id string) (stremioMeta, error) {
+	u := fmt.Sprintf("%s/meta/%s/%s.json", strings.TrimRight(base, "/"), url.PathEscape(mediaType), url.PathEscape(id))
+	var response stremioMetaResponse
+	if err := s.getJSON(ctx, u, &response); err != nil {
+		return stremioMeta{}, err
+	}
+	if strings.TrimSpace(response.Meta.ID) != "" || strings.TrimSpace(response.Meta.Name) != "" {
+		return response.Meta, nil
+	}
+	if len(response.Metas) > 0 {
+		return response.Metas[0], nil
+	}
+	if len(response.Items) > 0 {
+		return response.Items[0], nil
+	}
+	return stremioMeta{}, fmt.Errorf("empty meta response")
 }
 
 func (s *appState) fetchStreams(ctx context.Context, base string, req vortexoSourcesRequest, imdbID string) ([]stremioStream, error) {
@@ -1426,6 +1597,90 @@ func homeItemFromStremio(meta stremioMeta, fallbackType string) vortexoHomeItem 
 	}
 }
 
+func manifestDetailFromStremio(meta stremioMeta, fallbackType string) vortexoManifestDetail {
+	item := homeItemFromStremio(meta, fallbackType)
+	episodes := manifestEpisodesFromStremio(meta)
+	seasonSet := map[int]bool{}
+	for _, episode := range episodes {
+		seasonSet[episode.SeasonNumber] = true
+	}
+	detail := vortexoManifestDetail{
+		vortexoHomeItem:  item,
+		NumberOfSeasons:  len(seasonSet),
+		NumberOfEpisodes: len(episodes),
+		Metadata: &vortexoManifestMetadata{
+			IMDBID:           item.IMDBID,
+			ReleaseDate:      item.ReleaseDate,
+			FirstAirDate:     item.FirstAirDate,
+			OriginalLanguage: item.OriginalLanguage,
+			NumberOfSeasons:  len(seasonSet),
+			NumberOfEpisodes: len(episodes),
+		},
+	}
+	return detail
+}
+
+func manifestEpisodesFromStremio(meta stremioMeta) []vortexoManifestEpisode {
+	if len(meta.Videos) == 0 {
+		return []vortexoManifestEpisode{}
+	}
+
+	now := time.Now().Unix()
+	seriesID := firstNonEmpty(meta.ID, meta.IMDBID, imdbFromID(meta.ID), slug(firstNonEmpty(meta.Name, meta.Title)))
+	defaultStill := firstNonEmpty(meta.Background, meta.Poster)
+	defaultRuntime := runtimeMinutes(meta.Runtime)
+	defaultVote := floatFromText(meta.IMDBRating)
+
+	episodes := make([]vortexoManifestEpisode, 0, len(meta.Videos))
+	for _, video := range meta.Videos {
+		season := intFromAny(video.Season)
+		episodeNumber := intFromAny(video.Episode)
+		if season == 0 || episodeNumber == 0 {
+			idSeason, idEpisode := seasonEpisodeFromVideoID(video.ID)
+			if season == 0 {
+				season = idSeason
+			}
+			if episodeNumber == 0 {
+				episodeNumber = idEpisode
+			}
+		}
+		if episodeNumber == 0 {
+			continue
+		}
+
+		id := firstNonEmpty(video.ID, fmt.Sprintf("%s:%d:%d", seriesID, season, episodeNumber))
+		runtime := runtimeMinutes(video.Runtime)
+		if runtime == 0 {
+			runtime = defaultRuntime
+		}
+		episodes = append(episodes, vortexoManifestEpisode{
+			ID:            id,
+			TMDBID:        intFromAny(video.TMDBID),
+			Title:         firstNonEmpty(video.Title, video.Name, fmt.Sprintf("Episode %d", episodeNumber)),
+			Overview:      firstNonEmpty(video.Overview, video.Description),
+			StillPath:     firstNonEmpty(video.Thumbnail, video.Poster, defaultStill),
+			SeasonNumber:  season,
+			EpisodeNumber: episodeNumber,
+			Runtime:       runtime,
+			AirDate:       dateFromText(firstNonEmpty(video.Released, video.FirstAired)),
+			VoteAverage:   defaultVote,
+			AddedAt:       now,
+			UpdatedAt:     now,
+		})
+	}
+
+	sort.SliceStable(episodes, func(i, j int) bool {
+		if episodes[i].SeasonNumber != episodes[j].SeasonNumber {
+			return episodes[i].SeasonNumber < episodes[j].SeasonNumber
+		}
+		if episodes[i].EpisodeNumber != episodes[j].EpisodeNumber {
+			return episodes[i].EpisodeNumber < episodes[j].EpisodeNumber
+		}
+		return episodes[i].Title < episodes[j].Title
+	})
+	return episodes
+}
+
 func vortexoSourceFromStream(stream stremioStream, manifestName string, req vortexoSourcesRequest) (vortexoSource, bool) {
 	playURL := firstNonEmpty(stream.URL, stream.ExternalURL)
 	if playURL == "" {
@@ -1493,6 +1748,19 @@ func manifestSupportsResource(manifest stremioManifest, wanted string) bool {
 	return false
 }
 
+func manifestSupportsType(manifest stremioManifest, wanted string) bool {
+	wanted = normalizeStremioType(wanted)
+	if wanted == "" || len(manifest.Types) == 0 {
+		return true
+	}
+	for _, raw := range manifest.Types {
+		if normalizeStremioType(raw) == wanted {
+			return true
+		}
+	}
+	return false
+}
+
 func normalizeManifestURL(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -1515,6 +1783,18 @@ func normalizeManifestURL(raw string) string {
 	return parsed.String()
 }
 
+func normalizeStremioType(value string) string {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	switch {
+	case lower == "movie", lower == "movies", strings.HasSuffix(lower, ".movie"):
+		return "movie"
+	case lower == "series", lower == "tv", lower == "show", lower == "shows", strings.HasSuffix(lower, ".series"):
+		return "series"
+	default:
+		return ""
+	}
+}
+
 func normalizeCatalogType(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "movie", "movies":
@@ -1535,6 +1815,23 @@ func normalizeVortexoType(value string) string {
 	default:
 		return ""
 	}
+}
+
+func splitAPIIDTail(path string, prefix string) (string, string, bool) {
+	raw := strings.Trim(strings.TrimPrefix(path, prefix), "/")
+	if raw == "" || raw == path {
+		return "", "", false
+	}
+	parts := strings.Split(raw, "/")
+	id, err := url.PathUnescape(parts[0])
+	if err != nil {
+		id = parts[0]
+	}
+	tail := ""
+	if len(parts) > 1 {
+		tail = strings.Join(parts[1:], "/")
+	}
+	return strings.TrimSpace(id), strings.Trim(tail, "/"), true
 }
 
 func homeDedupeKey(item vortexoHomeItem) string {
@@ -1631,6 +1928,16 @@ func slug(value string) string {
 func imdbFromID(value string) string {
 	re := regexp.MustCompile(`tt\d{5,}`)
 	return re.FindString(value)
+}
+
+func seasonEpisodeFromVideoID(value string) (int, int) {
+	parts := strings.Split(strings.TrimSpace(value), ":")
+	if len(parts) < 3 {
+		return 0, 0
+	}
+	season, _ := strconv.Atoi(parts[len(parts)-2])
+	episode, _ := strconv.Atoi(parts[len(parts)-1])
+	return season, episode
 }
 
 func intFromAny(value any) int {
