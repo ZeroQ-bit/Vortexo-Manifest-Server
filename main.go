@@ -143,28 +143,42 @@ type stremioMetaResponse struct {
 }
 
 type stremioMeta struct {
-	ID            string         `json:"id"`
-	Type          string         `json:"type"`
-	Name          string         `json:"name"`
-	Title         string         `json:"title"`
-	Description   string         `json:"description"`
-	Poster        string         `json:"poster"`
-	PosterShape   string         `json:"posterShape"`
-	Background    string         `json:"background"`
-	Logo          string         `json:"logo"`
-	ReleaseInfo   string         `json:"releaseInfo"`
-	Year          any            `json:"year"`
-	Genres        []string       `json:"genres"`
-	IMDBRating    string         `json:"imdbRating"`
-	Runtime       string         `json:"runtime"`
-	TMDBID        any            `json:"tmdb_id"`
-	IMDBID        string         `json:"imdb_id"`
-	OriginalTitle string         `json:"originalTitle"`
-	OriginalName  string         `json:"originalName"`
-	Released      string         `json:"released"`
-	FirstAired    string         `json:"firstAired"`
-	BehaviorHints any            `json:"behaviorHints"`
-	Videos        []stremioVideo `json:"videos"`
+	ID             string                 `json:"id"`
+	Type           string                 `json:"type"`
+	Name           string                 `json:"name"`
+	Title          string                 `json:"title"`
+	Description    string                 `json:"description"`
+	Poster         string                 `json:"poster"`
+	PosterShape    string                 `json:"posterShape"`
+	Background     string                 `json:"background"`
+	Logo           string                 `json:"logo"`
+	ReleaseInfo    string                 `json:"releaseInfo"`
+	Year           any                    `json:"year"`
+	Genres         []string               `json:"genres"`
+	IMDBRating     string                 `json:"imdbRating"`
+	Runtime        string                 `json:"runtime"`
+	TMDBID         any                    `json:"tmdb_id"`
+	IMDBID         string                 `json:"imdb_id"`
+	OriginalTitle  string                 `json:"originalTitle"`
+	OriginalName   string                 `json:"originalName"`
+	Released       string                 `json:"released"`
+	FirstAired     string                 `json:"firstAired"`
+	BehaviorHints  any                    `json:"behaviorHints"`
+	Trailers       []stremioTrailer       `json:"trailers"`
+	TrailerStreams []stremioTrailerStream `json:"trailerStreams"`
+	Videos         []stremioVideo         `json:"videos"`
+}
+
+type stremioTrailer struct {
+	Source string `json:"source"`
+	Type   string `json:"type"`
+}
+
+type stremioTrailerStream struct {
+	Title     string `json:"title"`
+	YTID      string `json:"ytId"`
+	YouTubeID string `json:"youtubeId"`
+	URL       string `json:"url"`
 }
 
 type stremioVideo struct {
@@ -912,18 +926,18 @@ func (s *appState) handleMovieByID(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusNotFound, "movie not found")
 		return
 	}
-	if tail == "videos" {
-		respondJSON(w, http.StatusOK, map[string]any{"videos": []any{}})
-		return
-	}
-	if tail != "" {
-		respondError(w, http.StatusNotFound, "movie endpoint not found")
-		return
-	}
 
 	meta, err := s.findManifestMeta(r.Context(), "movie", id)
 	if err != nil {
 		respondError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if tail == "videos" {
+		respondJSON(w, http.StatusOK, map[string]any{"videos": manifestVideosFromStremio(meta)})
+		return
+	}
+	if tail != "" {
+		respondError(w, http.StatusNotFound, "movie endpoint not found")
 		return
 	}
 	respondJSON(w, http.StatusOK, map[string]any{"movie": manifestDetailFromStremio(meta, "movie")})
@@ -952,7 +966,7 @@ func (s *appState) handleSeriesByID(w http.ResponseWriter, r *http.Request) {
 	case "episodes":
 		respondJSON(w, http.StatusOK, map[string]any{"episodes": manifestEpisodesFromStremio(meta)})
 	case "videos":
-		respondJSON(w, http.StatusOK, map[string]any{"videos": []any{}})
+		respondJSON(w, http.StatusOK, map[string]any{"videos": manifestVideosFromStremio(meta)})
 	default:
 		respondError(w, http.StatusNotFound, "series endpoint not found")
 	}
@@ -1861,6 +1875,38 @@ func manifestEpisodesFromStremio(meta stremioMeta) []vortexoManifestEpisode {
 	return episodes
 }
 
+func manifestVideosFromStremio(meta stremioMeta) []map[string]any {
+	seen := map[string]bool{}
+	videos := []map[string]any{}
+
+	add := func(source string, title string, videoType string, official bool) {
+		key := youtubeVideoID(source)
+		if key == "" || seen[key] {
+			return
+		}
+		seen[key] = true
+		name := firstNonEmpty(title, firstNonEmpty(meta.Name, meta.Title)+" Trailer", "Trailer")
+		vType := firstNonEmpty(videoType, "Trailer")
+		videos = append(videos, map[string]any{
+			"id":       key,
+			"key":      key,
+			"name":     name,
+			"site":     "YouTube",
+			"type":     vType,
+			"official": official,
+		})
+	}
+
+	for _, trailer := range meta.Trailers {
+		add(trailer.Source, "", trailer.Type, true)
+	}
+	for _, stream := range meta.TrailerStreams {
+		add(firstNonEmpty(stream.YTID, stream.YouTubeID, stream.URL), stream.Title, "Trailer", true)
+	}
+
+	return videos
+}
+
 func xtreamMovieInfoFromStremio(meta stremioMeta) map[string]any {
 	item := homeItemFromStremio(meta, "movie")
 	info := map[string]any{
@@ -2200,6 +2246,35 @@ func slug(value string) string {
 func imdbFromID(value string) string {
 	re := regexp.MustCompile(`tt\d{5,}`)
 	return re.FindString(value)
+}
+
+func youtubeVideoID(value string) string {
+	value = strings.TrimSpace(html.UnescapeString(value))
+	if value == "" {
+		return ""
+	}
+	if parsed, err := url.Parse(value); err == nil && parsed.Host != "" {
+		host := strings.ToLower(parsed.Host)
+		if strings.Contains(host, "youtu.be") {
+			parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+			if len(parts) > 0 {
+				return strings.TrimSpace(parts[0])
+			}
+			return ""
+		}
+		if strings.Contains(host, "youtube.com") {
+			if id := strings.TrimSpace(parsed.Query().Get("v")); id != "" {
+				return id
+			}
+			parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+			for i, part := range parts {
+				if (part == "embed" || part == "shorts") && i+1 < len(parts) {
+					return strings.TrimSpace(parts[i+1])
+				}
+			}
+		}
+	}
+	return value
 }
 
 func seasonEpisodeFromVideoID(value string) (int, int) {
