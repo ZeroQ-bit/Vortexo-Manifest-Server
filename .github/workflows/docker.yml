@@ -33,5 +33,5 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/zeroq-bit/vortexo_server:main
-            ghcr.io/zeroq-bit/vortexo_server:${{ github.sha }}
+            ghcr.io/zeroq-bit/vortexo-manifest-server:main
+            ghcr.io/zeroq-bit/vortexo-manifest-server:${{ github.sha }}

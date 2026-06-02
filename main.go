@@ -363,12 +363,17 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/bridge/perfect-setup", s.requireAuth(s.handlePerfectSetup))
 	mux.HandleFunc("/api/v1/bridge/manifests", s.requireAuth(s.handleManifests))
 	mux.HandleFunc("/api/v1/bridge/manifests/", s.requireAuth(s.handleManifestByID))
-	mux.HandleFunc("/api/v1/movies/", s.requireAuth(s.handleMovieByID))
-	mux.HandleFunc("/api/v1/series/", s.requireAuth(s.handleSeriesByID))
+	mux.HandleFunc("/api/v1/movies", s.handleMovies)
+	mux.HandleFunc("/api/v1/movies/", s.handleMovieByID)
+	mux.HandleFunc("/api/v1/series", s.handleSeries)
+	mux.HandleFunc("/api/v1/series/", s.handleSeriesByID)
+	mux.HandleFunc("/api/v1/discover/trending", s.handleDiscoverList)
+	mux.HandleFunc("/api/v1/discover/popular", s.handleDiscoverList)
 	mux.HandleFunc("/api/v1/vortexo/capabilities", s.handleCapabilities)
 	mux.HandleFunc("/api/v1/vortexo/home", s.handleVortexoHome)
 	mux.HandleFunc("/api/v1/vortexo/sources", s.handleVortexoSources)
 	mux.HandleFunc("/api/v1/vortexo/play/", s.handleVortexoPlay)
+	mux.HandleFunc("/player_api.php", s.handleXtreamPlayerAPI)
 }
 
 func (s *appState) load() error {
@@ -515,7 +520,7 @@ func (s *appState) handleSettings(w http.ResponseWriter, _ *http.Request) {
 
 func (s *appState) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]any{
-		"name":                 "Vortexo Manifest Bridge",
+		"name":                 "Vortexo Manifest Server",
 		"home":                 true,
 		"source_api":           true,
 		"playback":             true,
@@ -720,6 +725,38 @@ func (s *appState) removeGeneratedManifests() {
 	s.mu.Unlock()
 }
 
+func (s *appState) handleMovies(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	limit := boundedInt(r.URL.Query().Get("limit"), 200, 1, 500)
+	offset := boundedInt(r.URL.Query().Get("offset"), 0, 0, 10_000)
+	respondJSON(w, http.StatusOK, map[string]any{
+		"movies": s.collectManifestItems(r.Context(), "movie", limit, offset),
+	})
+}
+
+func (s *appState) handleSeries(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	limit := boundedInt(r.URL.Query().Get("limit"), 200, 1, 500)
+	offset := boundedInt(r.URL.Query().Get("offset"), 0, 0, 10_000)
+	respondJSON(w, http.StatusOK, map[string]any{
+		"series": s.collectManifestItems(r.Context(), "tv", limit, offset),
+	})
+}
+
+func (s *appState) handleDiscoverList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"items": []any{}})
+}
+
 func (s *appState) handleVortexoHome(w http.ResponseWriter, r *http.Request) {
 	rowLimit := boundedInt(r.URL.Query().Get("row_limit"), 8, 1, 12)
 	itemLimit := boundedInt(r.URL.Query().Get("item_limit"), 30, 6, 50)
@@ -785,6 +822,55 @@ func (s *appState) handleVortexoHome(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *appState) collectManifestItems(ctx context.Context, mediaType string, limit int, offset int) []vortexoHomeItem {
+	installed := s.enabledManifests()
+	seen := map[string]bool{}
+	collected := make([]vortexoHomeItem, 0, limit)
+	skip := offset
+
+	for _, item := range installed {
+		if len(collected) >= limit {
+			break
+		}
+		manifest, base, err := s.fetchManifest(ctx, item.URL, false)
+		if err != nil {
+			log.Printf("library manifest %s failed: %v", item.URL, err)
+			continue
+		}
+		for _, catalog := range manifest.Catalogs {
+			if len(collected) >= limit {
+				break
+			}
+			if normalizeCatalogType(catalog.Type) != mediaType {
+				continue
+			}
+			items, err := s.fetchCatalog(ctx, base, catalog, limit+offset+25)
+			if err != nil {
+				log.Printf("library catalog %s/%s failed: %v", catalog.Type, catalog.ID, err)
+				continue
+			}
+			for _, meta := range items {
+				homeItem := homeItemFromStremio(meta, mediaType)
+				key := homeDedupeKey(homeItem)
+				if key == "" || seen[key] {
+					continue
+				}
+				seen[key] = true
+				if skip > 0 {
+					skip--
+					continue
+				}
+				collected = append(collected, homeItem)
+				if len(collected) >= limit {
+					break
+				}
+			}
+		}
+	}
+
+	return collected
+}
+
 func (s *appState) handleMovieByID(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -838,6 +924,46 @@ func (s *appState) handleSeriesByID(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, http.StatusOK, map[string]any{"videos": []any{}})
 	default:
 		respondError(w, http.StatusNotFound, "series endpoint not found")
+	}
+}
+
+func (s *appState) handleXtreamPlayerAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	switch r.URL.Query().Get("action") {
+	case "":
+		respondJSON(w, http.StatusOK, map[string]any{
+			"user_info": map[string]any{
+				"auth":   1,
+				"status": "Active",
+			},
+			"server_info": map[string]any{
+				"server_name": "Vortexo Manifest Server",
+			},
+		})
+	case "get_vod_info":
+		id := strings.TrimSpace(r.URL.Query().Get("vod_id"))
+		meta, err := s.findManifestMeta(r.Context(), "movie", id)
+		if err != nil {
+			respondError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		respondJSON(w, http.StatusOK, xtreamMovieInfoFromStremio(meta))
+	case "get_series_info":
+		id := strings.TrimSpace(r.URL.Query().Get("series_id"))
+		meta, err := s.findManifestMeta(r.Context(), "series", id)
+		if err != nil {
+			respondError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		respondJSON(w, http.StatusOK, xtreamSeriesInfoFromStremio(meta))
+	case "get_vod_streams", "get_series", "get_vod_categories", "get_series_categories", "get_live_categories":
+		respondJSON(w, http.StatusOK, []any{})
+	default:
+		respondJSON(w, http.StatusOK, []any{})
 	}
 }
 
@@ -1051,7 +1177,7 @@ func (s *appState) getJSON(ctx context.Context, rawURL string, target any) error
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "VortexoManifestBridge/1.0")
+	req.Header.Set("User-Agent", "VortexoManifestServer/1.0")
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return err
@@ -1084,7 +1210,7 @@ func (s *appState) postJSON(ctx context.Context, rawURL string, payload any, tar
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "VortexoManifestBridge/1.0")
+	req.Header.Set("User-Agent", "VortexoManifestServer/1.0")
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return err
@@ -1685,6 +1811,88 @@ func manifestEpisodesFromStremio(meta stremioMeta) []vortexoManifestEpisode {
 	return episodes
 }
 
+func xtreamMovieInfoFromStremio(meta stremioMeta) map[string]any {
+	item := homeItemFromStremio(meta, "movie")
+	info := map[string]any{
+		"tmdb_id":       item.TMDBID,
+		"imdb_id":       item.IMDBID,
+		"genre":         strings.Join(item.Genres, ", "),
+		"plot":          item.Overview,
+		"rating":        item.VoteAverage,
+		"release_date":  firstNonEmpty(item.ReleaseDate, item.FirstAirDate),
+		"duration_secs": item.Runtime * 60,
+		"movie_image":   item.PosterPath,
+		"cover":         item.PosterPath,
+		"backdrop_path": stringList(item.BackdropPath),
+	}
+	movieData := map[string]any{
+		"name":                item.Title,
+		"added":               item.AddedAt,
+		"container_extension": "mp4",
+	}
+	if item.TMDBID > 0 {
+		movieData["stream_id"] = item.TMDBID
+	}
+	return map[string]any{
+		"info":       info,
+		"movie_data": movieData,
+	}
+}
+
+func xtreamSeriesInfoFromStremio(meta stremioMeta) map[string]any {
+	item := homeItemFromStremio(meta, "series")
+	episodes := manifestEpisodesFromStremio(meta)
+	grouped := map[string][]map[string]any{}
+	for _, episode := range episodes {
+		seasonKey := strconv.Itoa(episode.SeasonNumber)
+		grouped[seasonKey] = append(grouped[seasonKey], xtreamEpisodeFromManifest(episode, item))
+	}
+
+	info := map[string]any{
+		"name":             item.Title,
+		"cover":            item.PosterPath,
+		"plot":             item.Overview,
+		"genre":            strings.Join(item.Genres, ", "),
+		"release_date":     firstNonEmpty(item.FirstAirDate, item.ReleaseDate),
+		"rating":           item.VoteAverage,
+		"backdrop_path":    stringList(item.BackdropPath),
+		"episode_run_time": item.Runtime,
+	}
+	return map[string]any{
+		"info":     info,
+		"episodes": grouped,
+	}
+}
+
+func xtreamEpisodeFromManifest(episode vortexoManifestEpisode, show vortexoHomeItem) map[string]any {
+	title := firstNonEmpty(episode.Title, fmt.Sprintf("Episode %d", episode.EpisodeNumber))
+	info := map[string]any{
+		"tmdb_id":       episode.TMDBID,
+		"name":          title,
+		"air_date":      episode.AirDate,
+		"cover_big":     firstNonEmpty(episode.StillPath, show.BackdropPath, show.PosterPath),
+		"plot":          episode.Overview,
+		"movie_image":   firstNonEmpty(episode.StillPath, show.BackdropPath, show.PosterPath),
+		"duration_secs": episode.Runtime * 60,
+		"rating":        episode.VoteAverage,
+	}
+	return map[string]any{
+		"id":          episode.ID,
+		"episode_num": episode.EpisodeNumber,
+		"title":       title,
+		"season":      episode.SeasonNumber,
+		"added":       episode.AddedAt,
+		"info":        info,
+	}
+}
+
+func stringList(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return []string{}
+	}
+	return []string{value}
+}
+
 func vortexoSourceFromStream(stream stremioStream, manifestName string, req vortexoSourcesRequest) (vortexoSource, bool) {
 	playURL := firstNonEmpty(stream.URL, stream.ExternalURL)
 	if playURL == "" {
@@ -2142,7 +2350,7 @@ const indexHTML = `<!doctype html>
     <div class="brand">
       <div class="brandMark">V</div>
       <div>
-        <h1>Vortexo Bridge</h1>
+        <h1>Vortexo Manifest Server</h1>
         <div class="subtitle">Manifest setup wizard</div>
       </div>
     </div>
@@ -2156,7 +2364,7 @@ const indexHTML = `<!doctype html>
       <button class="step" data-step="finish" onclick="showStep('finish')"><span class="dot"></span><span>Finish</span></button>
     </div>
     <div class="fineprint">
-      Vortexo Bridge stores only installed manifest URLs. Debrid, TMDB, TVDB, Gemini, and RPDB keys stay inside the upstream addon configurations you create.
+      Vortexo Manifest Server stores only installed manifest URLs. Debrid, TMDB, TVDB, Gemini, and RPDB keys stay inside the upstream addon configurations you create.
     </div>
   </aside>
   <main>
@@ -2170,7 +2378,7 @@ const indexHTML = `<!doctype html>
     <section class="stage">
       <div id="welcome" class="pane active">
         <div class="panel hero">
-          <h2>Welcome to Vortexo Bridge</h2>
+          <h2>Welcome to Vortexo Manifest Server</h2>
           <p>This wizard helps you turn a clean server into a working Vortexo backend. You create or paste AIOStreams and AIOMetadata manifests, then the Apple TV app keeps using the same Vortexo Server settings you already have.</p>
           <div class="grid" style="text-align:left; margin-top:24px;">
             <div class="card">
@@ -2214,7 +2422,7 @@ const indexHTML = `<!doctype html>
       <div id="accounts" class="pane">
         <div class="panel">
           <h2>Prepare Accounts and Keys</h2>
-          <p class="muted">Enter your own keys here and Vortexo Bridge will create AIOMetadata and AIOStreams manifests for you. Keys are sent to the selected upstream addon instance to create its normal manifest configuration; Vortexo Bridge stores only the returned manifest URLs.</p>
+          <p class="muted">Enter your own keys here and Vortexo Manifest Server will create AIOMetadata and AIOStreams manifests for you. Keys are sent to the selected upstream addon instance to create its normal manifest configuration; Vortexo Manifest Server stores only the returned manifest URLs.</p>
           <div class="checklist">
             <label class="check"><input type="checkbox" data-check="debrid"><span><strong>Debrid account</strong><br><span class="muted">Real-Debrid, TorBox, Premiumize, AllDebrid, or another provider supported by your AIOStreams instance.</span></span></label>
             <label class="check"><input type="checkbox" data-check="tmdb"><span><strong>TMDB key</strong><br><span class="muted">Helps metadata and catalog quality when your AIOMetadata instance requests it.</span></span></label>
@@ -2358,7 +2566,7 @@ const indexHTML = `<!doctype html>
 
       <div id="install" class="pane">
         <div class="panel">
-          <h2>Install Into Vortexo Bridge</h2>
+          <h2>Install Into Vortexo Manifest Server</h2>
           <p class="muted">Sign in first, then install one or both manifest URLs. You can come back later and replace them without changing the Apple TV app.</p>
           <div class="two">
             <div>

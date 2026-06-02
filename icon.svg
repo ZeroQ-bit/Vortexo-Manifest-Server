@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Vortexo Manifest Server">
+  <rect width="256" height="256" rx="56" fill="#2563eb"/>
+  <path d="M74 70h108c12 0 22 10 22 22v72c0 12-10 22-22 22H74c-12 0-22-10-22-22V92c0-12 10-22 22-22z" fill="#0f172a" opacity=".28"/>
+  <path d="M80 88h96c6.6 0 12 5.4 12 12v56c0 6.6-5.4 12-12 12H80c-6.6 0-12-5.4-12-12v-56c0-6.6 5.4-12 12-12zm10 18v44h76v-44H90z" fill="#ffffff"/>
+  <path d="M91 116l31 34 44-58h-25l-20 28-14-16H80z" fill="#93c5fd"/>
+  <path d="M82 196h92" stroke="#ffffff" stroke-width="16" stroke-linecap="round"/>
+  <path d="M128 168v34" stroke="#ffffff" stroke-width="16" stroke-linecap="round"/>
+</svg>
