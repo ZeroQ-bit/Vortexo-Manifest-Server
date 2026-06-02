@@ -1571,9 +1571,13 @@ func homeItemFromStremio(meta stremioMeta, fallbackType string) vortexoHomeItem 
 	} else if imdbID != "" {
 		guid = "imdb://" + imdbID
 	}
+	ratingType := mediaType
+	if ratingType == "tv" {
+		ratingType = "show"
+	}
 	return vortexoHomeItem{
 		ID:            id,
-		RatingKey:     "vortexo:manifest:" + mediaType + ":" + id,
+		RatingKey:     "vortexo:" + ratingType + ":" + id,
 		Key:           guid,
 		GUID:          guid,
 		MediaType:     mediaType,
