@@ -30,6 +30,8 @@ const (
 	defaultPassword   = "vortexo"
 )
 
+var srtTimestampPattern = regexp.MustCompile(`(\d{2}:\d{2}:\d{2}),(\d{3})`)
+
 type appState struct {
 	mu       sync.RWMutex
 	dataDir  string
@@ -199,6 +201,20 @@ type stremioVideo struct {
 
 type stremioStreamResponse struct {
 	Streams []stremioStream `json:"streams"`
+}
+
+type stremioSubtitleResponse struct {
+	Subtitles []stremioSubtitle `json:"subtitles"`
+	Subs      []stremioSubtitle `json:"subs"`
+}
+
+type stremioSubtitle struct {
+	ID       string `json:"id"`
+	URL      string `json:"url"`
+	Lang     string `json:"lang"`
+	Language string `json:"language"`
+	Name     string `json:"name"`
+	Title    string `json:"title"`
 }
 
 type stremioStream struct {
@@ -390,6 +406,7 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/vortexo/home", s.handleVortexoHome)
 	mux.HandleFunc("/api/v1/vortexo/sources", s.handleVortexoSources)
 	mux.HandleFunc("/api/v1/vortexo/play/", s.handleVortexoPlay)
+	mux.HandleFunc("/api/v1/vortexo/subtitles/", s.handleVortexoSubtitles)
 	mux.HandleFunc("/player_api.php", s.handleXtreamPlayerAPI)
 }
 
@@ -1100,6 +1117,54 @@ func (s *appState) handleVortexoPlay(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, token.URL, http.StatusFound)
 }
 
+func (s *appState) handleVortexoSubtitles(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	tokenValue, language, ok := splitSubtitlePath(r.URL.Path)
+	if !ok {
+		respondError(w, http.StatusBadRequest, "invalid subtitle request")
+		return
+	}
+	var req vortexoSourcesRequest
+	data, err := base64.RawURLEncoding.DecodeString(tokenValue)
+	if err != nil || json.Unmarshal(data, &req) != nil {
+		respondError(w, http.StatusBadRequest, "invalid subtitle token")
+		return
+	}
+	req.Type = normalizeVortexoType(req.Type)
+	if req.Type == "" {
+		respondError(w, http.StatusBadRequest, "type must be movie or episode")
+		return
+	}
+	imdbID := strings.TrimSpace(req.IMDBID)
+	if imdbID == "" {
+		respondError(w, http.StatusNotFound, "missing imdb id")
+		return
+	}
+
+	subtitle, base, err := s.findSubtitle(r.Context(), req, imdbID, language)
+	if err != nil {
+		respondError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	subtitleURL := absoluteURL(base, subtitle.URL)
+	if subtitleURL == "" {
+		respondError(w, http.StatusNotFound, "subtitle URL not found")
+		return
+	}
+	body, err := s.fetchSubtitleBody(r.Context(), subtitleURL)
+	if err != nil {
+		respondError(w, http.StatusBadGateway, "subtitle download failed: "+err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=900")
+	_, _ = w.Write(webVTTBody(body))
+}
+
 func (s *appState) enabledManifests() []installedManifest {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1276,6 +1341,78 @@ func (s *appState) fetchStreams(ctx context.Context, base string, req vortexoSou
 		return nil, err
 	}
 	return response.Streams, nil
+}
+
+func (s *appState) findSubtitle(ctx context.Context, req vortexoSourcesRequest, imdbID string, language string) (stremioSubtitle, string, error) {
+	aliases := subtitleLanguageAliasSet(language)
+	var lastErr error
+	for _, item := range s.enabledManifests() {
+		manifest, base, err := s.fetchManifest(ctx, item.URL, false)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if !manifestSupportsResource(manifest, "subtitles") || !manifestSupportsType(manifest, normalizeStremioTypeForVortexo(req.Type)) {
+			continue
+		}
+		subtitles, err := s.fetchSubtitles(ctx, base, req, imdbID)
+		if err != nil {
+			lastErr = err
+			log.Printf("subtitles %s failed: %v", item.URL, err)
+			continue
+		}
+		for _, subtitle := range subtitles {
+			if subtitle.URL == "" {
+				continue
+			}
+			if subtitleMatchesLanguage(subtitle, aliases) {
+				return subtitle, base, nil
+			}
+		}
+	}
+	if lastErr != nil {
+		return stremioSubtitle{}, "", fmt.Errorf("subtitle not found: %w", lastErr)
+	}
+	return stremioSubtitle{}, "", fmt.Errorf("subtitle not found")
+}
+
+func (s *appState) fetchSubtitles(ctx context.Context, base string, req vortexoSourcesRequest, imdbID string) ([]stremioSubtitle, error) {
+	var path string
+	if req.Type == "episode" {
+		if req.Season <= 0 || req.Episode <= 0 {
+			return nil, fmt.Errorf("season and episode are required")
+		}
+		path = fmt.Sprintf("subtitles/series/%s:%d:%d.json", url.PathEscape(imdbID), req.Season, req.Episode)
+	} else {
+		path = fmt.Sprintf("subtitles/movie/%s.json", url.PathEscape(imdbID))
+	}
+	u := strings.TrimRight(base, "/") + "/" + path
+	var response stremioSubtitleResponse
+	if err := s.getJSON(ctx, u, &response); err != nil {
+		return nil, err
+	}
+	if len(response.Subtitles) > 0 {
+		return response.Subtitles, nil
+	}
+	return response.Subs, nil
+}
+
+func (s *appState) fetchSubtitleBody(ctx context.Context, rawURL string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "text/vtt,application/x-subrip,text/plain,*/*")
+	req.Header.Set("User-Agent", "VortexoManifestServer/1.0")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
 }
 
 func (s *appState) getJSON(ctx context.Context, rawURL string, target any) error {
@@ -2171,6 +2308,17 @@ func normalizeStremioType(value string) string {
 	}
 }
 
+func normalizeStremioTypeForVortexo(value string) string {
+	switch normalizeVortexoType(value) {
+	case "movie":
+		return "movie"
+	case "episode":
+		return "series"
+	default:
+		return normalizeStremioType(value)
+	}
+}
+
 func normalizeCatalogType(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "movie", "movies":
@@ -2191,6 +2339,114 @@ func normalizeVortexoType(value string) string {
 	default:
 		return ""
 	}
+}
+
+func splitSubtitlePath(path string) (string, string, bool) {
+	raw := strings.Trim(strings.TrimPrefix(path, "/api/v1/vortexo/subtitles/"), "/")
+	if raw == "" || raw == path {
+		return "", "", false
+	}
+	parts := strings.Split(raw, "/")
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	token, err := url.PathUnescape(parts[0])
+	if err != nil {
+		token = parts[0]
+	}
+	language := strings.TrimSuffix(parts[1], ".vtt")
+	language = strings.TrimSuffix(language, ".srt")
+	language = strings.TrimSpace(strings.ToLower(language))
+	if token == "" || language == "" {
+		return "", "", false
+	}
+	return token, language, true
+}
+
+func subtitleLanguageAliasSet(language string) map[string]bool {
+	normalized := strings.ToLower(strings.TrimSpace(language))
+	aliases := []string{normalized}
+	switch normalized {
+	case "en", "eng", "english":
+		aliases = append(aliases, "en", "eng", "english")
+	case "hr", "hrv", "scr", "cro", "croatian", "hrvatski":
+		aliases = append(aliases, "hr", "hrv", "scr", "cro", "croatian", "hrvatski")
+	case "bs", "bos", "bosnian":
+		aliases = append(aliases, "bs", "bos", "bosnian")
+	case "sr", "srp", "scc", "serbian":
+		aliases = append(aliases, "sr", "srp", "scc", "serbian")
+	case "sl", "slv", "slovenian":
+		aliases = append(aliases, "sl", "slv", "slovenian")
+	case "mk", "mkd", "macedonian":
+		aliases = append(aliases, "mk", "mkd", "macedonian")
+	}
+	out := map[string]bool{}
+	for _, alias := range aliases {
+		alias = strings.ToLower(strings.TrimSpace(alias))
+		if alias != "" {
+			out[alias] = true
+		}
+	}
+	return out
+}
+
+func subtitleMatchesLanguage(subtitle stremioSubtitle, aliases map[string]bool) bool {
+	for _, value := range []string{
+		subtitle.Lang,
+		subtitle.Language,
+		subtitle.ID,
+		subtitle.Name,
+		subtitle.Title,
+	} {
+		normalized := strings.ToLower(strings.TrimSpace(value))
+		if normalized == "" {
+			continue
+		}
+		if aliases[normalized] {
+			return true
+		}
+		fields := strings.FieldsFunc(normalized, func(r rune) bool {
+			return r == '-' || r == '_' || r == ' ' || r == '[' || r == ']' || r == '(' || r == ')' || r == '.'
+		})
+		for _, field := range fields {
+			if aliases[strings.TrimSpace(field)] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func absoluteURL(base string, rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return ""
+	}
+	parsed, err := url.Parse(rawURL)
+	if err == nil && parsed.IsAbs() {
+		return parsed.String()
+	}
+	baseURL, err := url.Parse(strings.TrimRight(base, "/") + "/")
+	if err != nil {
+		return rawURL
+	}
+	relative, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	return baseURL.ResolveReference(relative).String()
+}
+
+func webVTTBody(data []byte) []byte {
+	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
+	trimmed := bytes.TrimSpace(data)
+	if bytes.HasPrefix(bytes.ToUpper(trimmed), []byte("WEBVTT")) {
+		return trimmed
+	}
+	text := strings.ReplaceAll(string(trimmed), "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	text = srtTimestampPattern.ReplaceAllString(text, "$1.$2")
+	return []byte("WEBVTT\n\n" + strings.TrimSpace(text) + "\n")
 }
 
 func splitAPIIDTail(path string, prefix string) (string, string, bool) {
