@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"html"
@@ -33,11 +34,12 @@ const (
 var srtTimestampPattern = regexp.MustCompile(`(\d{2}:\d{2}:\d{2}),(\d{3})`)
 
 type appState struct {
-	mu       sync.RWMutex
-	dataDir  string
-	config   bridgeConfig
-	client   *http.Client
-	manifest map[string]manifestCacheEntry
+	mu         sync.RWMutex
+	dataDir    string
+	config     bridgeConfig
+	watchState watchStateStore
+	client     *http.Client
+	manifest   map[string]manifestCacheEntry
 }
 
 type bridgeConfig struct {
@@ -45,6 +47,27 @@ type bridgeConfig struct {
 	AdminPassword string              `json:"admin_password"`
 	AuthToken     string              `json:"auth_token"`
 	Manifests     []installedManifest `json:"manifests"`
+	Watch         watchSyncConfig     `json:"watch,omitempty"`
+}
+
+type watchSyncConfig struct {
+	Trakt traktWatchConfig `json:"trakt,omitempty"`
+	Plex  plexWatchConfig  `json:"plex,omitempty"`
+}
+
+type traktWatchConfig struct {
+	ClientID       string    `json:"client_id,omitempty"`
+	ClientSecret   string    `json:"client_secret,omitempty"`
+	AccessToken    string    `json:"access_token,omitempty"`
+	RefreshToken   string    `json:"refresh_token,omitempty"`
+	TokenExpiresAt time.Time `json:"token_expires_at,omitempty"`
+	LastSyncAt     time.Time `json:"last_sync_at,omitempty"`
+}
+
+type plexWatchConfig struct {
+	ServerURL  string    `json:"server_url,omitempty"`
+	Token      string    `json:"token,omitempty"`
+	LastSyncAt time.Time `json:"last_sync_at,omitempty"`
 }
 
 type installedManifest struct {
@@ -402,10 +425,193 @@ type vortexoSource struct {
 	PlayURL      string  `json:"play_url"`
 }
 
+type watchStateStore struct {
+	UpdatedAt time.Time        `json:"updated_at"`
+	Items     []watchStateItem `json:"items"`
+}
+
+type watchStateItem struct {
+	ID              string    `json:"id"`
+	MediaType       string    `json:"media_type"`
+	Title           string    `json:"title,omitempty"`
+	ParentTitle     string    `json:"parent_title,omitempty"`
+	Year            int       `json:"year,omitempty"`
+	IMDBID          string    `json:"imdb_id,omitempty"`
+	TMDBID          int       `json:"tmdb_id,omitempty"`
+	TVDBID          int       `json:"tvdb_id,omitempty"`
+	TraktID         int       `json:"trakt_id,omitempty"`
+	PlexRatingKey   string    `json:"plex_rating_key,omitempty"`
+	Season          int       `json:"season,omitempty"`
+	Episode         int       `json:"episode,omitempty"`
+	Watched         bool      `json:"watched"`
+	WatchedAt       time.Time `json:"watched_at,omitempty"`
+	ProgressPercent float64   `json:"progress_percent,omitempty"`
+	ProgressSeconds int       `json:"progress_seconds,omitempty"`
+	DurationSeconds int       `json:"duration_seconds,omitempty"`
+	PlayCount       int       `json:"play_count,omitempty"`
+	Source          string    `json:"source"`
+	SourceUserID    string    `json:"source_user_id,omitempty"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+type watchSettingsRequest struct {
+	TraktClientID     string `json:"trakt_client_id"`
+	TraktClientSecret string `json:"trakt_client_secret"`
+	TraktAccessToken  string `json:"trakt_access_token"`
+	TraktRefreshToken string `json:"trakt_refresh_token"`
+	ClearTraktTokens  bool   `json:"clear_trakt_tokens"`
+	PlexServerURL     string `json:"plex_server_url"`
+	PlexToken         string `json:"plex_token"`
+	ClearPlexToken    bool   `json:"clear_plex_token"`
+}
+
+type traktDeviceCodeRequest struct {
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+}
+
+type traktDeviceTokenRequest struct {
+	DeviceCode string `json:"device_code"`
+}
+
 type playToken struct {
 	URL     string            `json:"url"`
 	Headers map[string]string `json:"headers,omitempty"`
 	Title   string            `json:"title,omitempty"`
+}
+
+type traktDeviceCodeResponse struct {
+	DeviceCode      string `json:"device_code"`
+	UserCode        string `json:"user_code"`
+	VerificationURL string `json:"verification_url"`
+	ExpiresIn       int    `json:"expires_in"`
+	Interval        int    `json:"interval"`
+}
+
+type traktTokenResponse struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresIn    int    `json:"expires_in"`
+	TokenType    string `json:"token_type"`
+	Scope        string `json:"scope"`
+	CreatedAt    int64  `json:"created_at"`
+}
+
+type traktIDs struct {
+	Trakt int    `json:"trakt"`
+	Slug  string `json:"slug"`
+	IMDB  string `json:"imdb"`
+	TMDB  int    `json:"tmdb"`
+	TVDB  int    `json:"tvdb"`
+}
+
+type traktMovie struct {
+	Title string   `json:"title"`
+	Year  int      `json:"year"`
+	IDs   traktIDs `json:"ids"`
+}
+
+type traktShow struct {
+	Title string   `json:"title"`
+	Year  int      `json:"year"`
+	IDs   traktIDs `json:"ids"`
+}
+
+type traktEpisode struct {
+	Season int      `json:"season"`
+	Number int      `json:"number"`
+	Title  string   `json:"title"`
+	IDs    traktIDs `json:"ids"`
+}
+
+type traktWatchedMovie struct {
+	Plays         int        `json:"plays"`
+	LastWatchedAt time.Time  `json:"last_watched_at"`
+	Movie         traktMovie `json:"movie"`
+}
+
+type traktWatchedShow struct {
+	Plays         int           `json:"plays"`
+	LastWatchedAt time.Time     `json:"last_watched_at"`
+	Show          traktShow     `json:"show"`
+	Seasons       []traktSeason `json:"seasons"`
+}
+
+type traktSeason struct {
+	Number   int                   `json:"number"`
+	Episodes []traktEpisodeWatched `json:"episodes"`
+}
+
+type traktEpisodeWatched struct {
+	Number        int       `json:"number"`
+	Plays         int       `json:"plays"`
+	LastWatchedAt time.Time `json:"last_watched_at"`
+}
+
+type traktPlaybackMovie struct {
+	Progress float64    `json:"progress"`
+	PausedAt time.Time  `json:"paused_at"`
+	Movie    traktMovie `json:"movie"`
+}
+
+type traktPlaybackEpisode struct {
+	Progress float64      `json:"progress"`
+	PausedAt time.Time    `json:"paused_at"`
+	Show     traktShow    `json:"show"`
+	Episode  traktEpisode `json:"episode"`
+}
+
+type plexHistoryResponse struct {
+	MediaContainer plexMediaContainer `json:"MediaContainer"`
+}
+
+type plexMediaContainer struct {
+	Metadata []plexMetadata `json:"Metadata"`
+}
+
+type plexMetadata struct {
+	RatingKey        string     `json:"ratingKey"`
+	Type             string     `json:"type"`
+	Title            string     `json:"title"`
+	GrandparentTitle string     `json:"grandparentTitle"`
+	Year             int        `json:"year"`
+	Index            int        `json:"index"`
+	ParentIndex      int        `json:"parentIndex"`
+	ViewedAt         int64      `json:"viewedAt"`
+	LastViewedAt     int64      `json:"lastViewedAt"`
+	ViewOffset       int        `json:"viewOffset"`
+	Duration         int        `json:"duration"`
+	GUID             string     `json:"guid"`
+	Guids            []plexGuid `json:"Guid"`
+}
+
+type plexGuid struct {
+	ID string `json:"id"`
+}
+
+type plexHistoryXML struct {
+	XMLName xml.Name       `xml:"MediaContainer"`
+	Videos  []plexXMLVideo `xml:"Video"`
+}
+
+type plexXMLVideo struct {
+	RatingKey        string        `xml:"ratingKey,attr"`
+	Type             string        `xml:"type,attr"`
+	Title            string        `xml:"title,attr"`
+	GrandparentTitle string        `xml:"grandparentTitle,attr"`
+	Year             int           `xml:"year,attr"`
+	Index            int           `xml:"index,attr"`
+	ParentIndex      int           `xml:"parentIndex,attr"`
+	ViewedAt         int64         `xml:"viewedAt,attr"`
+	LastViewedAt     int64         `xml:"lastViewedAt,attr"`
+	ViewOffset       int           `xml:"viewOffset,attr"`
+	Duration         int           `xml:"duration,attr"`
+	GUID             string        `xml:"guid,attr"`
+	Guids            []plexXMLGuid `xml:"Guid"`
+}
+
+type plexXMLGuid struct {
+	ID string `xml:"id,attr"`
 }
 
 func main() {
@@ -426,6 +632,9 @@ func run() error {
 		manifest: map[string]manifestCacheEntry{},
 	}
 	if err := state.load(); err != nil {
+		return err
+	}
+	if err := state.loadWatchState(); err != nil {
 		return err
 	}
 
@@ -450,6 +659,11 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/bridge/perfect-setup", s.requireAuth(s.handlePerfectSetup))
 	mux.HandleFunc("/api/v1/bridge/manifests", s.requireAuth(s.handleManifests))
 	mux.HandleFunc("/api/v1/bridge/manifests/", s.requireAuth(s.handleManifestByID))
+	mux.HandleFunc("/api/v1/bridge/watch/settings", s.requireAuth(s.handleWatchSettings))
+	mux.HandleFunc("/api/v1/bridge/watch/trakt/device-code", s.requireAuth(s.handleTraktDeviceCode))
+	mux.HandleFunc("/api/v1/bridge/watch/trakt/device-token", s.requireAuth(s.handleTraktDeviceToken))
+	mux.HandleFunc("/api/v1/bridge/watch/trakt/sync", s.requireAuth(s.handleTraktWatchSync))
+	mux.HandleFunc("/api/v1/bridge/watch/plex/sync", s.requireAuth(s.handlePlexWatchSync))
 	mux.HandleFunc("/api/v1/movies", s.handleMovies)
 	mux.HandleFunc("/api/v1/movies/", s.handleMovieByID)
 	mux.HandleFunc("/api/v1/series", s.handleSeries)
@@ -463,6 +677,7 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/vortexo/capabilities", s.handleCapabilities)
 	mux.HandleFunc("/api/v1/vortexo/home", s.handleVortexoHome)
 	mux.HandleFunc("/api/v1/vortexo/live-tv/rows", s.handleVortexoLiveTVRows)
+	mux.HandleFunc("/api/v1/vortexo/watch-state", s.requireAuth(s.handleVortexoWatchState))
 	mux.HandleFunc("/api/v1/vortexo/sources", s.handleVortexoSources)
 	mux.HandleFunc("/api/v1/vortexo/play/", s.handleVortexoPlay)
 	mux.HandleFunc("/api/v1/vortexo/subtitles/", s.handleVortexoSubtitles)
@@ -520,6 +735,41 @@ func (s *appState) saveLocked() error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(s.dataDir, "config.json"), data, 0o600)
+}
+
+func (s *appState) loadWatchState() error {
+	path := filepath.Join(s.dataDir, "watch_state.json")
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		s.watchState = watchStateStore{UpdatedAt: time.Now().UTC(), Items: []watchStateItem{}}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var state watchStateStore
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &state); err != nil {
+			return err
+		}
+	}
+	if state.Items == nil {
+		state.Items = []watchStateItem{}
+	}
+	s.watchState = state
+	return nil
+}
+
+func (s *appState) saveWatchStateLocked() error {
+	s.watchState.UpdatedAt = time.Now().UTC()
+	if s.watchState.Items == nil {
+		s.watchState.Items = []watchStateItem{}
+	}
+	data, err := json.MarshalIndent(s.watchState, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(s.dataDir, "watch_state.json"), data, 0o600)
 }
 
 func (s *appState) withCORS(next http.Handler) http.Handler {
@@ -621,6 +871,174 @@ func (s *appState) handleSettings(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+func (s *appState) handleWatchSettings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.mu.RLock()
+		watch := s.config.Watch
+		count := len(s.watchState.Items)
+		updatedAt := s.watchState.UpdatedAt
+		s.mu.RUnlock()
+		respondJSON(w, http.StatusOK, map[string]any{
+			"trakt": map[string]any{
+				"client_id":         watch.Trakt.ClientID,
+				"has_client_secret": watch.Trakt.ClientSecret != "",
+				"has_access_token":  watch.Trakt.AccessToken != "",
+				"has_refresh_token": watch.Trakt.RefreshToken != "",
+				"token_expires_at":  watch.Trakt.TokenExpiresAt,
+				"last_sync_at":      watch.Trakt.LastSyncAt,
+			},
+			"plex": map[string]any{
+				"server_url":   watch.Plex.ServerURL,
+				"has_token":    watch.Plex.Token != "",
+				"last_sync_at": watch.Plex.LastSyncAt,
+			},
+			"watch_state": map[string]any{
+				"count":      count,
+				"updated_at": updatedAt,
+			},
+		})
+	case http.MethodPost:
+		var req watchSettingsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			respondError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		s.mu.Lock()
+		if strings.TrimSpace(req.TraktClientID) != "" {
+			s.config.Watch.Trakt.ClientID = strings.TrimSpace(req.TraktClientID)
+		}
+		if strings.TrimSpace(req.TraktClientSecret) != "" {
+			s.config.Watch.Trakt.ClientSecret = strings.TrimSpace(req.TraktClientSecret)
+		}
+		if req.ClearTraktTokens {
+			s.config.Watch.Trakt.AccessToken = ""
+			s.config.Watch.Trakt.RefreshToken = ""
+			s.config.Watch.Trakt.TokenExpiresAt = time.Time{}
+		} else {
+			if strings.TrimSpace(req.TraktAccessToken) != "" {
+				s.config.Watch.Trakt.AccessToken = strings.TrimSpace(req.TraktAccessToken)
+			}
+			if strings.TrimSpace(req.TraktRefreshToken) != "" {
+				s.config.Watch.Trakt.RefreshToken = strings.TrimSpace(req.TraktRefreshToken)
+			}
+		}
+		if strings.TrimSpace(req.PlexServerURL) != "" {
+			s.config.Watch.Plex.ServerURL = strings.TrimRight(strings.TrimSpace(req.PlexServerURL), "/")
+		}
+		if req.ClearPlexToken {
+			s.config.Watch.Plex.Token = ""
+		} else if strings.TrimSpace(req.PlexToken) != "" {
+			s.config.Watch.Plex.Token = strings.TrimSpace(req.PlexToken)
+		}
+		err := s.saveLocked()
+		s.mu.Unlock()
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, "failed to save watch settings")
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"ok": true})
+	default:
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *appState) handleTraktDeviceCode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req traktDeviceCodeRequest
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if strings.TrimSpace(req.ClientID) != "" || strings.TrimSpace(req.ClientSecret) != "" {
+		s.mu.Lock()
+		if strings.TrimSpace(req.ClientID) != "" {
+			s.config.Watch.Trakt.ClientID = strings.TrimSpace(req.ClientID)
+		}
+		if strings.TrimSpace(req.ClientSecret) != "" {
+			s.config.Watch.Trakt.ClientSecret = strings.TrimSpace(req.ClientSecret)
+		}
+		err := s.saveLocked()
+		s.mu.Unlock()
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, "failed to save Trakt settings")
+			return
+		}
+	}
+	deviceCode, err := s.createTraktDeviceCode(r.Context())
+	if err != nil {
+		respondError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	respondJSON(w, http.StatusOK, deviceCode)
+}
+
+func (s *appState) handleTraktDeviceToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req traktDeviceTokenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	token, err := s.pollTraktDeviceToken(r.Context(), req.DeviceCode)
+	if err != nil {
+		respondError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	respondJSON(w, http.StatusOK, token)
+}
+
+func (s *appState) handleTraktWatchSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	items, err := s.syncTraktWatchState(r.Context())
+	if err != nil {
+		respondError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"imported": len(items),
+		"total":    s.watchStateCount(),
+	})
+}
+
+func (s *appState) handlePlexWatchSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	items, err := s.syncPlexWatchState(r.Context())
+	if err != nil {
+		respondError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"imported": len(items),
+		"total":    s.watchStateCount(),
+	})
+}
+
+func (s *appState) handleVortexoWatchState(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	s.mu.RLock()
+	state := s.watchState
+	if state.Items == nil {
+		state.Items = []watchStateItem{}
+	}
+	s.mu.RUnlock()
+	respondJSON(w, http.StatusOK, state)
+}
+
 func (s *appState) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]any{
 		"name":                 "Vortexo Manifest Server",
@@ -631,9 +1049,10 @@ func (s *appState) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 		"seasons":              true,
 		"episodes":             true,
 		"live_tv":              true,
+		"watch_history":        true,
 		"manifest_bridge":      true,
 		"requires_app_changes": false,
-		"types":                []string{"movie", "show", "season", "episode", "live_tv"},
+		"types":                []string{"movie", "show", "season", "episode", "live_tv", "watch_history"},
 	})
 }
 
@@ -1502,6 +1921,279 @@ func (s *appState) handleXtreamPlayerAPI(w http.ResponseWriter, r *http.Request)
 	default:
 		respondJSON(w, http.StatusOK, []any{})
 	}
+}
+
+func (s *appState) watchStateCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.watchState.Items)
+}
+
+func (s *appState) upsertWatchStateItems(items []watchStateItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	existing := map[string]int{}
+	for i := range s.watchState.Items {
+		key := watchStateKey(s.watchState.Items[i])
+		if key != "" {
+			existing[key] = i
+		}
+	}
+
+	for _, item := range items {
+		key := watchStateKey(item)
+		if key == "" {
+			continue
+		}
+		item.ID = key
+		if item.UpdatedAt.IsZero() {
+			item.UpdatedAt = now
+		}
+		if idx, ok := existing[key]; ok {
+			s.watchState.Items[idx] = mergeWatchStateItem(s.watchState.Items[idx], item)
+			continue
+		}
+		existing[key] = len(s.watchState.Items)
+		s.watchState.Items = append(s.watchState.Items, item)
+	}
+
+	sort.SliceStable(s.watchState.Items, func(i, j int) bool {
+		return s.watchState.Items[i].UpdatedAt.After(s.watchState.Items[j].UpdatedAt)
+	})
+	return s.saveWatchStateLocked()
+}
+
+func (s *appState) createTraktDeviceCode(ctx context.Context) (traktDeviceCodeResponse, error) {
+	s.mu.RLock()
+	clientID := strings.TrimSpace(s.config.Watch.Trakt.ClientID)
+	s.mu.RUnlock()
+	if clientID == "" {
+		return traktDeviceCodeResponse{}, fmt.Errorf("Trakt client ID is required")
+	}
+
+	body, _ := json.Marshal(map[string]string{"client_id": clientID})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.trakt.tv/oauth/device/code", bytes.NewReader(body))
+	if err != nil {
+		return traktDeviceCodeResponse{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return traktDeviceCodeResponse{}, err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return traktDeviceCodeResponse{}, fmt.Errorf("Trakt device code failed: HTTP %d %s", resp.StatusCode, responseMessage(data))
+	}
+	var out traktDeviceCodeResponse
+	if err := json.Unmarshal(data, &out); err != nil {
+		return traktDeviceCodeResponse{}, err
+	}
+	return out, nil
+}
+
+func (s *appState) pollTraktDeviceToken(ctx context.Context, deviceCode string) (map[string]any, error) {
+	deviceCode = strings.TrimSpace(deviceCode)
+	if deviceCode == "" {
+		return nil, fmt.Errorf("device code is required")
+	}
+	s.mu.RLock()
+	clientID := strings.TrimSpace(s.config.Watch.Trakt.ClientID)
+	clientSecret := strings.TrimSpace(s.config.Watch.Trakt.ClientSecret)
+	s.mu.RUnlock()
+	if clientID == "" || clientSecret == "" {
+		return nil, fmt.Errorf("Trakt client ID and secret are required")
+	}
+
+	body, _ := json.Marshal(map[string]string{
+		"code":          deviceCode,
+		"client_id":     clientID,
+		"client_secret": clientSecret,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.trakt.tv/oauth/device/token", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("Trakt device token pending or failed: HTTP %d %s", resp.StatusCode, responseMessage(data))
+	}
+	var token traktTokenResponse
+	if err := json.Unmarshal(data, &token); err != nil {
+		return nil, err
+	}
+	expiresAt := time.Now().UTC().Add(time.Duration(token.ExpiresIn) * time.Second)
+	s.mu.Lock()
+	s.config.Watch.Trakt.AccessToken = token.AccessToken
+	s.config.Watch.Trakt.RefreshToken = token.RefreshToken
+	s.config.Watch.Trakt.TokenExpiresAt = expiresAt
+	err = s.saveLocked()
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"ok":               true,
+		"has_access_token": token.AccessToken != "",
+		"expires_at":       expiresAt,
+	}, nil
+}
+
+func (s *appState) syncTraktWatchState(ctx context.Context) ([]watchStateItem, error) {
+	var watchedMovies []traktWatchedMovie
+	var watchedShows []traktWatchedShow
+	var playbackMovies []traktPlaybackMovie
+	var playbackEpisodes []traktPlaybackEpisode
+
+	if err := s.traktGetJSON(ctx, "/sync/watched/movies", &watchedMovies); err != nil {
+		return nil, err
+	}
+	if err := s.traktGetJSON(ctx, "/sync/watched/shows", &watchedShows); err != nil {
+		return nil, err
+	}
+	if err := s.traktGetJSON(ctx, "/sync/playback/movies", &playbackMovies); err != nil {
+		return nil, err
+	}
+	if err := s.traktGetJSON(ctx, "/sync/playback/episodes", &playbackEpisodes); err != nil {
+		return nil, err
+	}
+
+	items := make([]watchStateItem, 0, len(watchedMovies)+len(playbackMovies)+len(playbackEpisodes))
+	for _, entry := range watchedMovies {
+		items = append(items, watchItemFromTraktMovie(entry.Movie, true, entry.LastWatchedAt, 0, entry.Plays))
+	}
+	for _, show := range watchedShows {
+		for _, season := range show.Seasons {
+			for _, episode := range season.Episodes {
+				item := watchItemFromTraktEpisode(show.Show, traktEpisode{
+					Season: season.Number,
+					Number: episode.Number,
+				}, true, episode.LastWatchedAt, 0, episode.Plays)
+				items = append(items, item)
+			}
+		}
+	}
+	for _, entry := range playbackMovies {
+		items = append(items, watchItemFromTraktMovie(entry.Movie, entry.Progress >= 90, entry.PausedAt, entry.Progress, 0))
+	}
+	for _, entry := range playbackEpisodes {
+		items = append(items, watchItemFromTraktEpisode(entry.Show, entry.Episode, entry.Progress >= 90, entry.PausedAt, entry.Progress, 0))
+	}
+
+	if err := s.upsertWatchStateItems(items); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	s.config.Watch.Trakt.LastSyncAt = time.Now().UTC()
+	err := s.saveLocked()
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func (s *appState) traktGetJSON(ctx context.Context, path string, target any) error {
+	s.mu.RLock()
+	clientID := strings.TrimSpace(s.config.Watch.Trakt.ClientID)
+	accessToken := strings.TrimSpace(s.config.Watch.Trakt.AccessToken)
+	s.mu.RUnlock()
+	if clientID == "" || accessToken == "" {
+		return fmt.Errorf("Trakt client ID and access token are required")
+	}
+	u := "https://api.trakt.tv" + path
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("trakt-api-version", "2")
+	req.Header.Set("trakt-api-key", clientID)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("Trakt %s failed: HTTP %d %s", path, resp.StatusCode, responseMessage(data))
+	}
+	return json.Unmarshal(data, target)
+}
+
+func (s *appState) syncPlexWatchState(ctx context.Context) ([]watchStateItem, error) {
+	s.mu.RLock()
+	baseURL := strings.TrimRight(strings.TrimSpace(s.config.Watch.Plex.ServerURL), "/")
+	token := strings.TrimSpace(s.config.Watch.Plex.Token)
+	s.mu.RUnlock()
+	if baseURL == "" || token == "" {
+		return nil, fmt.Errorf("Plex server URL and token are required")
+	}
+
+	u, err := url.Parse(baseURL + "/status/sessions/history/all")
+	if err != nil {
+		return nil, err
+	}
+	q := u.Query()
+	q.Set("X-Plex-Token", token)
+	q.Set("sort", "viewedAt:desc")
+	q.Set("size", "500")
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json, application/xml;q=0.8, */*;q=0.1")
+	req.Header.Set("X-Plex-Product", "Vortexo Manifest Server")
+	req.Header.Set("X-Plex-Client-Identifier", "vortexo-manifest-server")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("Plex history import failed: HTTP %d %s", resp.StatusCode, responseMessage(data))
+	}
+
+	metas, err := decodePlexHistory(data)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]watchStateItem, 0, len(metas))
+	for _, meta := range metas {
+		if item, ok := watchItemFromPlex(meta); ok {
+			items = append(items, item)
+		}
+	}
+	if err := s.upsertWatchStateItems(items); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	s.config.Watch.Plex.LastSyncAt = time.Now().UTC()
+	err = s.saveLocked()
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 func (s *appState) handleVortexoSources(w http.ResponseWriter, r *http.Request) {
@@ -3045,6 +3737,314 @@ func homeItemMatchesSearch(item vortexoHomeItem, normalizedQuery string) bool {
 	return true
 }
 
+func watchItemFromTraktMovie(movie traktMovie, watched bool, updatedAt time.Time, progress float64, playCount int) watchStateItem {
+	if updatedAt.IsZero() {
+		updatedAt = time.Now().UTC()
+	}
+	item := watchStateItem{
+		MediaType:       "movie",
+		Title:           movie.Title,
+		Year:            movie.Year,
+		IMDBID:          strings.TrimSpace(movie.IDs.IMDB),
+		TMDBID:          movie.IDs.TMDB,
+		TVDBID:          movie.IDs.TVDB,
+		TraktID:         movie.IDs.Trakt,
+		Watched:         watched,
+		ProgressPercent: progress,
+		PlayCount:       playCount,
+		Source:          "trakt",
+		UpdatedAt:       updatedAt,
+	}
+	if watched {
+		item.WatchedAt = updatedAt
+	}
+	item.ID = watchStateKey(item)
+	return item
+}
+
+func watchItemFromTraktEpisode(show traktShow, episode traktEpisode, watched bool, updatedAt time.Time, progress float64, playCount int) watchStateItem {
+	if updatedAt.IsZero() {
+		updatedAt = time.Now().UTC()
+	}
+	season := episode.Season
+	if season == 0 {
+		season = 1
+	}
+	item := watchStateItem{
+		MediaType:       "episode",
+		Title:           firstNonEmpty(episode.Title, show.Title),
+		ParentTitle:     show.Title,
+		Year:            show.Year,
+		IMDBID:          strings.TrimSpace(show.IDs.IMDB),
+		TMDBID:          show.IDs.TMDB,
+		TVDBID:          firstNonZero(show.IDs.TVDB, episode.IDs.TVDB),
+		TraktID:         firstNonZero(episode.IDs.Trakt, show.IDs.Trakt),
+		Season:          season,
+		Episode:         episode.Number,
+		Watched:         watched,
+		ProgressPercent: progress,
+		PlayCount:       playCount,
+		Source:          "trakt",
+		UpdatedAt:       updatedAt,
+	}
+	if watched {
+		item.WatchedAt = updatedAt
+	}
+	item.ID = watchStateKey(item)
+	return item
+}
+
+func decodePlexHistory(data []byte) ([]plexMetadata, error) {
+	var jsonResponse plexHistoryResponse
+	if err := json.Unmarshal(data, &jsonResponse); err == nil && len(jsonResponse.MediaContainer.Metadata) > 0 {
+		return jsonResponse.MediaContainer.Metadata, nil
+	}
+
+	var xmlResponse plexHistoryXML
+	if err := xml.Unmarshal(data, &xmlResponse); err != nil {
+		return nil, err
+	}
+	metas := make([]plexMetadata, 0, len(xmlResponse.Videos))
+	for _, video := range xmlResponse.Videos {
+		guids := make([]plexGuid, 0, len(video.Guids))
+		for _, guid := range video.Guids {
+			guids = append(guids, plexGuid{ID: guid.ID})
+		}
+		metas = append(metas, plexMetadata{
+			RatingKey:        video.RatingKey,
+			Type:             video.Type,
+			Title:            video.Title,
+			GrandparentTitle: video.GrandparentTitle,
+			Year:             video.Year,
+			Index:            video.Index,
+			ParentIndex:      video.ParentIndex,
+			ViewedAt:         video.ViewedAt,
+			LastViewedAt:     video.LastViewedAt,
+			ViewOffset:       video.ViewOffset,
+			Duration:         video.Duration,
+			GUID:             video.GUID,
+			Guids:            guids,
+		})
+	}
+	return metas, nil
+}
+
+func watchItemFromPlex(meta plexMetadata) (watchStateItem, bool) {
+	mediaType := normalizePlexWatchType(meta.Type)
+	if mediaType == "" {
+		return watchStateItem{}, false
+	}
+	updatedAt := unixTime(firstNonZero64(meta.LastViewedAt, meta.ViewedAt))
+	if updatedAt.IsZero() {
+		updatedAt = time.Now().UTC()
+	}
+	imdbID, tmdbID, tvdbID := plexIDs(meta)
+	durationSeconds := meta.Duration / 1000
+	progressSeconds := meta.ViewOffset / 1000
+	progress := 0.0
+	if durationSeconds > 0 && progressSeconds > 0 {
+		progress = float64(progressSeconds) / float64(durationSeconds) * 100
+	}
+
+	item := watchStateItem{
+		MediaType:       mediaType,
+		Title:           meta.Title,
+		ParentTitle:     meta.GrandparentTitle,
+		Year:            meta.Year,
+		IMDBID:          imdbID,
+		TMDBID:          tmdbID,
+		TVDBID:          tvdbID,
+		PlexRatingKey:   meta.RatingKey,
+		Season:          meta.ParentIndex,
+		Episode:         meta.Index,
+		Watched:         true,
+		WatchedAt:       updatedAt,
+		ProgressPercent: progress,
+		ProgressSeconds: progressSeconds,
+		DurationSeconds: durationSeconds,
+		PlayCount:       1,
+		Source:          "plex",
+		UpdatedAt:       updatedAt,
+	}
+	if mediaType == "episode" && item.Title == "" {
+		item.Title = meta.GrandparentTitle
+	}
+	item.ID = watchStateKey(item)
+	return item, item.ID != ""
+}
+
+func plexIDs(meta plexMetadata) (string, int, int) {
+	rawIDs := []string{meta.GUID}
+	for _, guid := range meta.Guids {
+		rawIDs = append(rawIDs, guid.ID)
+	}
+	return mediaIDsFromStrings(rawIDs)
+}
+
+func mediaIDsFromStrings(rawIDs []string) (string, int, int) {
+	var imdbID string
+	var tmdbID int
+	var tvdbID int
+	for _, raw := range rawIDs {
+		raw = strings.TrimSpace(raw)
+		lower := strings.ToLower(raw)
+		if imdbID == "" {
+			imdbID = imdbFromID(raw)
+		}
+		if tmdbID == 0 && strings.Contains(lower, "tmdb") {
+			tmdbID = trailingInt(raw)
+		}
+		if tvdbID == 0 && strings.Contains(lower, "tvdb") {
+			tvdbID = trailingInt(raw)
+		}
+	}
+	return imdbID, tmdbID, tvdbID
+}
+
+func normalizePlexWatchType(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "movie":
+		return "movie"
+	case "episode":
+		return "episode"
+	default:
+		return ""
+	}
+}
+
+func watchStateKey(item watchStateItem) string {
+	mediaType := strings.ToLower(strings.TrimSpace(item.MediaType))
+	if mediaType != "movie" && mediaType != "episode" {
+		return ""
+	}
+	id := firstNonEmpty(item.IMDBID)
+	if id == "" && item.TMDBID > 0 {
+		id = "tmdb:" + strconv.Itoa(item.TMDBID)
+	}
+	if id == "" && item.TVDBID > 0 {
+		id = "tvdb:" + strconv.Itoa(item.TVDBID)
+	}
+	if id == "" && item.TraktID > 0 {
+		id = "trakt:" + strconv.Itoa(item.TraktID)
+	}
+	if id == "" && item.PlexRatingKey != "" {
+		id = "plex:" + item.PlexRatingKey
+	}
+	if id == "" {
+		id = slug(firstNonEmpty(item.ParentTitle, item.Title) + "-" + strconv.Itoa(item.Year))
+	}
+	if id == "" {
+		return ""
+	}
+	if mediaType == "episode" {
+		if item.Season <= 0 || item.Episode <= 0 {
+			return ""
+		}
+		return fmt.Sprintf("episode:%s:%d:%d", strings.ToLower(id), item.Season, item.Episode)
+	}
+	return "movie:" + strings.ToLower(id)
+}
+
+func mergeWatchStateItem(existing watchStateItem, incoming watchStateItem) watchStateItem {
+	if existing.ID == "" {
+		existing.ID = watchStateKey(existing)
+	}
+	existing.Title = firstNonEmpty(existing.Title, incoming.Title)
+	existing.ParentTitle = firstNonEmpty(existing.ParentTitle, incoming.ParentTitle)
+	existing.Year = firstNonZero(existing.Year, incoming.Year)
+	existing.IMDBID = firstNonEmpty(existing.IMDBID, incoming.IMDBID)
+	existing.TMDBID = firstNonZero(existing.TMDBID, incoming.TMDBID)
+	existing.TVDBID = firstNonZero(existing.TVDBID, incoming.TVDBID)
+	existing.TraktID = firstNonZero(existing.TraktID, incoming.TraktID)
+	existing.PlexRatingKey = firstNonEmpty(existing.PlexRatingKey, incoming.PlexRatingKey)
+	existing.Season = firstNonZero(existing.Season, incoming.Season)
+	existing.Episode = firstNonZero(existing.Episode, incoming.Episode)
+	existing.Watched = existing.Watched || incoming.Watched
+	existing.WatchedAt = maxTime(existing.WatchedAt, incoming.WatchedAt)
+	existing.PlayCount = maxInt(existing.PlayCount, incoming.PlayCount)
+	existing.Source = mergeSourceLabel(existing.Source, incoming.Source)
+
+	if !incoming.UpdatedAt.IsZero() && (existing.UpdatedAt.IsZero() || !incoming.UpdatedAt.Before(existing.UpdatedAt)) {
+		if incoming.ProgressPercent > 0 {
+			existing.ProgressPercent = incoming.ProgressPercent
+		}
+		if incoming.ProgressSeconds > 0 {
+			existing.ProgressSeconds = incoming.ProgressSeconds
+		}
+		if incoming.DurationSeconds > 0 {
+			existing.DurationSeconds = incoming.DurationSeconds
+		}
+		existing.UpdatedAt = incoming.UpdatedAt
+	}
+	if existing.UpdatedAt.IsZero() {
+		existing.UpdatedAt = incoming.UpdatedAt
+	}
+	return existing
+}
+
+func mergeSourceLabel(existing string, incoming string) string {
+	existing = strings.TrimSpace(existing)
+	incoming = strings.TrimSpace(incoming)
+	if existing == "" {
+		return incoming
+	}
+	if incoming == "" || strings.Contains(","+existing+",", ","+incoming+",") {
+		return existing
+	}
+	return existing + "," + incoming
+}
+
+func maxTime(a time.Time, b time.Time) time.Time {
+	if a.IsZero() {
+		return b
+	}
+	if b.After(a) {
+		return b
+	}
+	return a
+}
+
+func firstNonZero(values ...int) int {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func firstNonZero64(values ...int64) int64 {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func maxInt(a int, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func unixTime(value int64) time.Time {
+	if value <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(value, 0).UTC()
+}
+
+func trailingInt(value string) int {
+	matches := regexp.MustCompile(`\d+`).FindAllString(value, -1)
+	if len(matches) == 0 {
+		return 0
+	}
+	parsed, _ := strconv.Atoi(matches[len(matches)-1])
+	return parsed
+}
+
 func randomToken() string {
 	var data [32]byte
 	if _, err := rand.Read(data[:]); err != nil {
@@ -3410,11 +4410,12 @@ const indexHTML = `<!doctype html>
       <button class="step" data-step="accounts" onclick="showStep('accounts')"><span class="dot"></span><span>Accounts</span></button>
       <button class="step" data-step="catalogs" onclick="showStep('catalogs')"><span class="dot"></span><span>Catalogs</span></button>
       <button class="step" data-step="streams" onclick="showStep('streams')"><span class="dot"></span><span>Streams</span></button>
+      <button class="step" data-step="watch" onclick="showStep('watch')"><span class="dot"></span><span>Watch Sync</span></button>
       <button class="step" data-step="install" onclick="showStep('install')"><span class="dot"></span><span>Install</span></button>
       <button class="step" data-step="finish" onclick="showStep('finish')"><span class="dot"></span><span>Finish</span></button>
     </div>
     <div class="fineprint">
-      Vortexo Manifest Server stores only installed manifest URLs. Debrid, TMDB, TVDB, Gemini, and RPDB keys stay inside the upstream addon configurations you create.
+      Vortexo Manifest Server stores installed manifest URLs and optional watch-sync credentials locally on this server.
     </div>
   </aside>
   <main>
@@ -3614,6 +4615,50 @@ const indexHTML = `<!doctype html>
         </div>
       </div>
 
+      <div id="watch" class="pane">
+        <div class="panel">
+          <h2>Watch History Import</h2>
+          <p class="muted">Optional. Import watched state and resume progress into this Vortexo Manifest Server. The Apple TV app can read this normalized local state after app-side integration.</p>
+          <div class="grid">
+            <div class="card">
+              <h3>Trakt</h3>
+              <p>Imports watched movies, watched episodes, and paused playback progress from your Trakt account.</p>
+              <label>Trakt Client ID</label>
+              <input id="traktClientId" placeholder="Your Trakt app client ID">
+              <label>Trakt Client Secret</label>
+              <input id="traktClientSecret" type="password" placeholder="Leave blank to keep saved secret">
+              <label>Access Token</label>
+              <input id="traktAccessToken" type="password" placeholder="Paste token or use device login">
+              <label>Refresh Token</label>
+              <input id="traktRefreshToken" type="password" placeholder="Optional">
+              <div class="actions">
+                <button onclick="saveWatchSettings()">Save Trakt</button>
+                <button class="secondary" onclick="startTraktDeviceLogin()">Device Login</button>
+                <button class="secondary" onclick="syncTraktWatch()">Sync Trakt</button>
+              </div>
+              <div id="traktDeviceBox" class="message muted"></div>
+            </div>
+            <div class="card">
+              <h3>Plex</h3>
+              <p>Imports watched history from a Plex server using your own server URL and token.</p>
+              <label>Plex Server URL</label>
+              <input id="plexServerUrl" placeholder="http://192.168.1.63:32400">
+              <label>Plex Token</label>
+              <input id="plexToken" type="password" placeholder="Leave blank to keep saved token">
+              <div class="actions">
+                <button onclick="saveWatchSettings()">Save Plex</button>
+                <button class="secondary" onclick="syncPlexWatch()">Sync Plex</button>
+              </div>
+            </div>
+          </div>
+          <div class="actions">
+            <button class="secondary" onclick="loadWatchSettings()">Refresh Watch Status</button>
+            <button onclick="showStep('install')">Continue</button>
+          </div>
+          <div id="watchStatus" class="message muted">Sign in to load watch sync status.</div>
+        </div>
+      </div>
+
       <div id="install" class="pane">
         <div class="panel">
           <h2>Install Into Vortexo Manifest Server</h2>
@@ -3670,10 +4715,11 @@ const indexHTML = `<!doctype html>
 </div>
 <script>
 let token = localStorage.getItem("vortexoToken") || "";
-const stepOrder = ["welcome", "signin", "accounts", "catalogs", "streams", "install", "finish"];
+const stepOrder = ["welcome", "signin", "accounts", "catalogs", "streams", "watch", "install", "finish"];
 function showStep(id) {
   document.querySelectorAll(".pane").forEach((el) => el.classList.toggle("active", el.id === id));
   document.querySelectorAll(".step").forEach((el) => el.classList.toggle("active", el.dataset.step === id));
+  if (id === "watch") loadWatchSettings();
   if (id === "install") syncInstallInputs();
   if (id === "finish") updateServerUrl();
 }
@@ -3693,6 +4739,7 @@ async function login() {
   loginStatus.className = "ok";
   markDone("signin");
   loadManifests();
+  loadWatchSettings();
   showStep("accounts");
 }
 async function loadManifests() {
@@ -3813,6 +4860,98 @@ async function generatePerfectSetup() {
   markDone("install");
   await loadManifests();
   showStep("finish");
+}
+async function loadWatchSettings() {
+  if (!token) return;
+  const res = await fetch("/api/v1/bridge/watch/settings", {headers:{authorization:"Bearer " + token}});
+  if (!res.ok) { watchStatus.textContent = "Unable to load watch sync settings."; watchStatus.className = "message error"; return; }
+  const data = await res.json();
+  const trakt = data.trakt || {};
+  const plex = data.plex || {};
+  const state = data.watch_state || {};
+  traktClientId.value = trakt.client_id || "";
+  plexServerUrl.value = plex.server_url || "";
+  watchStatus.innerHTML = "Watch items: <strong>" + escapeHtml(String(state.count || 0)) + "</strong>"
+    + " · Trakt token: " + (trakt.has_access_token ? "<span class='ok'>saved</span>" : "<span class='muted'>missing</span>")
+    + " · Plex token: " + (plex.has_token ? "<span class='ok'>saved</span>" : "<span class='muted'>missing</span>");
+  watchStatus.className = "message muted";
+}
+async function saveWatchSettings() {
+  if (!token) { watchStatus.textContent = "Sign in first."; watchStatus.className = "message error"; showStep("signin"); return; }
+  const payload = {
+    trakt_client_id: traktClientId.value.trim(),
+    trakt_client_secret: traktClientSecret.value.trim(),
+    trakt_access_token: traktAccessToken.value.trim(),
+    trakt_refresh_token: traktRefreshToken.value.trim(),
+    plex_server_url: plexServerUrl.value.trim(),
+    plex_token: plexToken.value.trim()
+  };
+  const res = await fetch("/api/v1/bridge/watch/settings", {method:"POST", headers:{"content-type":"application/json", authorization:"Bearer " + token}, body: JSON.stringify(payload)});
+  const data = await res.json();
+  if (!res.ok) { watchStatus.textContent = data.message || "Failed to save watch settings."; watchStatus.className = "message error"; return; }
+  traktClientSecret.value = "";
+  traktAccessToken.value = "";
+  traktRefreshToken.value = "";
+  plexToken.value = "";
+  markDone("watch");
+  watchStatus.textContent = "Watch sync settings saved.";
+  watchStatus.className = "message ok";
+  await loadWatchSettings();
+}
+async function startTraktDeviceLogin() {
+  if (!token) { watchStatus.textContent = "Sign in first."; watchStatus.className = "message error"; showStep("signin"); return; }
+  await saveWatchSettings();
+  traktDeviceBox.textContent = "Requesting Trakt device code...";
+  const res = await fetch("/api/v1/bridge/watch/trakt/device-code", {method:"POST", headers:{"content-type":"application/json", authorization:"Bearer " + token}, body: JSON.stringify({client_id: traktClientId.value.trim(), client_secret: traktClientSecret.value.trim()})});
+  const data = await res.json();
+  if (!res.ok) { traktDeviceBox.textContent = data.message || "Trakt device login failed."; traktDeviceBox.className = "message error"; return; }
+  localStorage.setItem("vortexoTraktDeviceCode", data.device_code || "");
+  traktDeviceBox.innerHTML = "Open <a href='" + escapeAttr(data.verification_url || "https://trakt.tv/activate") + "' target='_blank' rel='noreferrer'>Trakt activation</a> and enter code <code>" + escapeHtml(data.user_code || "") + "</code>. Then click Check Login.";
+  traktDeviceBox.className = "message ok";
+  if (!document.getElementById("checkTraktDeviceButton")) {
+    const btn = document.createElement("button");
+    btn.id = "checkTraktDeviceButton";
+    btn.className = "secondary";
+    btn.textContent = "Check Login";
+    btn.onclick = pollTraktDeviceLogin;
+    traktDeviceBox.appendChild(document.createElement("br"));
+    traktDeviceBox.appendChild(btn);
+  }
+}
+async function pollTraktDeviceLogin() {
+  const deviceCode = localStorage.getItem("vortexoTraktDeviceCode") || "";
+  if (!deviceCode) { traktDeviceBox.textContent = "No device code saved. Start device login again."; traktDeviceBox.className = "message error"; return; }
+  traktDeviceBox.textContent = "Checking Trakt login...";
+  const res = await fetch("/api/v1/bridge/watch/trakt/device-token", {method:"POST", headers:{"content-type":"application/json", authorization:"Bearer " + token}, body: JSON.stringify({device_code: deviceCode})});
+  const data = await res.json();
+  if (!res.ok) { traktDeviceBox.textContent = data.message || "Still waiting for Trakt approval."; traktDeviceBox.className = "message error"; return; }
+  localStorage.removeItem("vortexoTraktDeviceCode");
+  traktDeviceBox.textContent = "Trakt connected.";
+  traktDeviceBox.className = "message ok";
+  await loadWatchSettings();
+}
+async function syncTraktWatch() {
+  if (!token) { watchStatus.textContent = "Sign in first."; watchStatus.className = "message error"; showStep("signin"); return; }
+  watchStatus.textContent = "Syncing Trakt watch history...";
+  watchStatus.className = "message muted";
+  const res = await fetch("/api/v1/bridge/watch/trakt/sync", {method:"POST", headers:{authorization:"Bearer " + token}});
+  const data = await res.json();
+  if (!res.ok) { watchStatus.textContent = data.message || "Trakt sync failed."; watchStatus.className = "message error"; return; }
+  markDone("watch");
+  watchStatus.textContent = "Trakt sync imported " + (data.imported || 0) + " items. Total watch items: " + (data.total || 0) + ".";
+  watchStatus.className = "message ok";
+}
+async function syncPlexWatch() {
+  if (!token) { watchStatus.textContent = "Sign in first."; watchStatus.className = "message error"; showStep("signin"); return; }
+  await saveWatchSettings();
+  watchStatus.textContent = "Syncing Plex watch history...";
+  watchStatus.className = "message muted";
+  const res = await fetch("/api/v1/bridge/watch/plex/sync", {method:"POST", headers:{authorization:"Bearer " + token}});
+  const data = await res.json();
+  if (!res.ok) { watchStatus.textContent = data.message || "Plex sync failed."; watchStatus.className = "message error"; return; }
+  markDone("watch");
+  watchStatus.textContent = "Plex sync imported " + (data.imported || 0) + " items. Total watch items: " + (data.total || 0) + ".";
+  watchStatus.className = "message ok";
 }
 async function removeManifest(id) {
   await fetch("/api/v1/bridge/manifests/" + encodeURIComponent(id), {method:"DELETE", headers:{authorization:"Bearer " + token}});
