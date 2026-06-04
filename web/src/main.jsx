@@ -85,9 +85,6 @@ function App() {
     traktClientSecret: "",
     traktAccessToken: "",
     traktRefreshToken: "",
-    plexServerUrl: "",
-    plexToken: "",
-    plexTokenSaved: false,
   });
 
   const signedIn = Boolean(token);
@@ -201,8 +198,6 @@ function App() {
       setWatchForm((current) => ({
         ...current,
         traktClientId: data.trakt?.client_id || "",
-        plexServerUrl: data.plex?.server_url || "",
-        plexTokenSaved: Boolean(data.plex?.has_token),
       }));
     } catch {
       // Optional panel; keep the dashboard usable.
@@ -449,8 +444,6 @@ function App() {
           trakt_client_secret: watchForm.traktClientSecret.trim(),
           trakt_access_token: watchForm.traktAccessToken.trim(),
           trakt_refresh_token: watchForm.traktRefreshToken.trim(),
-          plex_server_url: watchForm.plexServerUrl.trim(),
-          plex_token: watchForm.plexToken.trim(),
         }),
       });
       setWatchForm((current) => ({
@@ -458,8 +451,6 @@ function App() {
         traktClientSecret: "",
         traktAccessToken: "",
         traktRefreshToken: "",
-        plexToken: "",
-        plexTokenSaved: current.plexTokenSaved || Boolean(current.plexToken.trim()),
       }));
       await loadDashboard();
       await loadWatchSettings();
@@ -473,34 +464,19 @@ function App() {
     }
   }
 
-  async function syncWatch(kind) {
+  async function syncWatch() {
     setBusy(true);
-    const label = kind === "trakt" ? "Trakt" : "Plex";
-    setWatchStatus(`Syncing ${label} watch history...`);
+    setWatchStatus("Syncing Trakt watch history...");
     try {
-      if (kind === "plex") {
-        const plexServerUrl = watchForm.plexServerUrl.trim();
-        const hasPlexToken = Boolean(watchForm.plexToken.trim() || watchForm.plexTokenSaved || dashboard.watch?.plex_connected);
-        if (!plexServerUrl) throw new Error("Plex server URL is required.");
-        if (!hasPlexToken) throw new Error("Plex token is required. Paste a token, press Save, then sync again.");
-        await request("/api/v1/bridge/watch/settings", {
-          method: "POST",
-          body: JSON.stringify({
-            plex_server_url: plexServerUrl,
-            plex_token: watchForm.plexToken.trim(),
-          }),
-        });
-      }
-      const path = kind === "trakt" ? "/api/v1/bridge/watch/trakt/sync" : "/api/v1/bridge/watch/plex/sync";
-      const data = await request(path, { method: "POST" });
+      const data = await request("/api/v1/bridge/watch/trakt/sync", { method: "POST" });
       await loadDashboard();
       await loadWatchSettings();
       await loadPublicHome();
       const imported = data.imported || 0;
       const total = data.total || 0;
       const nextMessage = imported > 0
-        ? `${label} imported ${imported} items. Total watch items: ${total}.`
-        : `${label} sync completed but imported 0 new items. Total watch items: ${total}.`;
+        ? `Trakt imported ${imported} items. Total watch items: ${total}.`
+        : `Trakt sync completed but imported 0 new items. Total watch items: ${total}.`;
       setMessage(nextMessage);
       setWatchStatus(nextMessage);
     } catch (error) {
@@ -1045,13 +1021,12 @@ function Setup({ perfect, setPerfect, onSubmit, busy }) {
 }
 
 function WatchSync({ watch, form, setForm, status, onSave, onSync, busy }) {
-  const hasPlexToken = Boolean(watch.plex_connected || form.plexTokenSaved || form.plexToken.trim());
   const hasTraktConfig = Boolean(watch.trakt_client_config || form.traktClientId.trim());
   return (
     <section className="stack">
       <div className="metric-grid two-cols">
         <Metric icon={Eye} label="Watch items" value={watch.count || 0} detail="Local normalized state" />
-        <Metric icon={BadgeCheck} label="Connections" value={(watch.trakt_connected ? 1 : 0) + (watch.plex_connected ? 1 : 0)} detail="Trakt and Plex" />
+        <Metric icon={BadgeCheck} label="Connections" value={watch.trakt_connected ? 1 : 0} detail="Trakt" />
       </div>
       <form className="panel" onSubmit={onSave}>
         <div className="section-head">
@@ -1065,20 +1040,10 @@ function WatchSync({ watch, form, setForm, status, onSave, onSync, busy }) {
           <TextField label="Trakt client secret" type="password" value={form.traktClientSecret} onChange={(value) => setForm({ ...form, traktClientSecret: value })} />
           <TextField label="Trakt access token" type="password" value={form.traktAccessToken} onChange={(value) => setForm({ ...form, traktAccessToken: value })} />
           <TextField label="Trakt refresh token" type="password" value={form.traktRefreshToken} onChange={(value) => setForm({ ...form, traktRefreshToken: value })} />
-          <TextField label="Plex server URL" value={form.plexServerUrl} onChange={(value) => setForm({ ...form, plexServerUrl: value })} />
-          <TextField
-            label="Plex token"
-            type="password"
-            value={form.plexToken}
-            placeholder={hasPlexToken ? "Saved token will be used" : "Required for Plex sync"}
-            help={hasPlexToken ? "A Plex token is already saved. Paste a new one only if you want to replace it." : "Paste your Plex token, save, then sync Plex."}
-            onChange={(value) => setForm({ ...form, plexToken: value })}
-          />
         </div>
         <div className="form-actions">
           <button type="submit" disabled={busy}>Save</button>
-          <button type="button" className="secondary" onClick={() => onSync("trakt")} disabled={busy || !hasTraktConfig}>Sync Trakt</button>
-          <button type="button" className="secondary" onClick={() => onSync("plex")} disabled={busy || !form.plexServerUrl.trim() || !hasPlexToken}>Sync Plex</button>
+          <button type="button" className="secondary" onClick={onSync} disabled={busy || !hasTraktConfig}>Sync Trakt</button>
         </div>
         {status && <div className={isErrorMessage(status) ? "inline-error" : "inline-note"}>{status}</div>}
       </form>
