@@ -1,6 +1,6 @@
-# Vortexo Manifest Server
+# Vortexo Add-on Server
 
-Vortexo Manifest Server is the self-hosted companion server for the Vortexo Apple TV app. It lets you install Stremio-compatible manifest URLs on your own server, then Vortexo reads the server as a single configured source.
+Vortexo Add-on Server is the self-hosted companion server for the Vortexo Apple TV app. It lets you install Stremio-compatible manifest URLs on your own server, then Vortexo reads the server as a single configured source.
 
 The server stores your installed manifest URLs and local configuration. It does not bundle add-ons, content, debrid accounts, fallback API keys, or paid service credentials.
 
@@ -12,7 +12,7 @@ The server stores your installed manifest URLs and local configuration. It does 
 - Optional subtitle lookups from installed subtitle manifests.
 - Optional Live TV manifests when supported by the installed add-on.
 - Optional watch state and Up Next rows from Trakt and Plex imports.
-- A browser setup wizard for installing and managing manifests.
+- A premium browser dashboard for installing manifests, inspecting add-ons, previewing catalog output, and managing watch sync.
 
 Vortexo Pro is required in the Apple TV app to use manifest-server features.
 
@@ -60,7 +60,7 @@ Do not use `localhost` in the Apple TV app unless the server is actually running
 
 ## Apple TV Setup
 
-1. Open the Vortexo Manifest Server dashboard in a browser.
+1. Open the Vortexo Add-on Server dashboard in a browser.
 2. Sign in with the admin username and password from `.env`.
 3. Install your catalog, stream, subtitle, Live TV, Trakt, or Plex manifests.
 4. Open Vortexo on Apple TV.
@@ -106,6 +106,33 @@ docker compose up -d --build
 ```
 
 Your installed manifests and settings are stored in `./data`, so normal rebuilds keep your setup.
+
+## Development
+
+The backend is Go and the dashboard is a Vite/React app in `web/`.
+
+Build the dashboard:
+
+```bash
+cd web
+npm install
+npm run build
+```
+
+Run the server locally:
+
+```bash
+cd ..
+VORTEXO_DATA_DIR=./data VORTEXO_LISTEN_ADDR=:18456 go run .
+```
+
+Open:
+
+```text
+http://localhost:18456
+```
+
+If `web/dist` is missing, the server falls back to the original embedded setup page.
 
 ## Data And Backups
 

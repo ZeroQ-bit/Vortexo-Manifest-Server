@@ -79,6 +79,33 @@ type installedManifest struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+type dashboardManifest struct {
+	ID           string                     `json:"id"`
+	Name         string                     `json:"name"`
+	URL          string                     `json:"url"`
+	Enabled      bool                       `json:"enabled"`
+	CreatedAt    time.Time                  `json:"created_at"`
+	UpdatedAt    time.Time                  `json:"updated_at"`
+	Status       string                     `json:"status"`
+	Message      string                     `json:"message,omitempty"`
+	Description  string                     `json:"description,omitempty"`
+	Version      string                     `json:"version,omitempty"`
+	Logo         string                     `json:"logo,omitempty"`
+	Resources    []string                   `json:"resources"`
+	Types        []string                   `json:"types"`
+	Capabilities []string                   `json:"capabilities"`
+	Catalogs     []dashboardManifestCatalog `json:"catalogs"`
+}
+
+type dashboardManifestCatalog struct {
+	Type           string   `json:"type"`
+	ID             string   `json:"id"`
+	Name           string   `json:"name"`
+	Search         bool     `json:"search"`
+	RequiredExtras []string `json:"required_extras,omitempty"`
+	OptionalExtras []string `json:"optional_extras,omitempty"`
+}
+
 type perfectSetupRequest struct {
 	Install         bool                    `json:"install"`
 	ReplaceExisting bool                    `json:"replace_existing"`
@@ -145,6 +172,8 @@ type stremioManifest struct {
 	ID          string           `json:"id"`
 	Name        string           `json:"name"`
 	Description string           `json:"description"`
+	Version     string           `json:"version"`
+	Logo        string           `json:"logo"`
 	Resources   []any            `json:"resources"`
 	Types       []string         `json:"types"`
 	Catalogs    []stremioCatalog `json:"catalogs"`
@@ -653,7 +682,7 @@ func run() error {
 	if !strings.HasPrefix(addr, ":") && !strings.Contains(addr, ":") {
 		addr = ":" + addr
 	}
-	log.Printf("Vortexo Manifest Server listening on %s", addr)
+	log.Printf("Vortexo Add-on Server listening on %s", addr)
 	return http.ListenAndServe(addr, state.withCORS(mux))
 }
 
@@ -664,6 +693,7 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/auth/login", s.handleLogin)
 	mux.HandleFunc("/api/v1/auth/verify", s.requireAuth(s.handleVerify))
 	mux.HandleFunc("/api/v1/settings", s.handleSettings)
+	mux.HandleFunc("/api/v1/bridge/dashboard", s.requireAuth(s.handleBridgeDashboard))
 	mux.HandleFunc("/api/v1/bridge/perfect-setup", s.requireAuth(s.handlePerfectSetup))
 	mux.HandleFunc("/api/v1/bridge/manifests", s.requireAuth(s.handleManifests))
 	mux.HandleFunc("/api/v1/bridge/manifests/", s.requireAuth(s.handleManifestByID))
@@ -822,6 +852,13 @@ func (s *appState) authorized(r *http.Request) bool {
 }
 
 func (s *appState) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		http.NotFound(w, r)
+		return
+	}
+	if s.serveWebApp(w, r) {
+		return
+	}
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
@@ -830,8 +867,29 @@ func (s *appState) handleIndex(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, indexHTML)
 }
 
+func (s *appState) serveWebApp(w http.ResponseWriter, r *http.Request) bool {
+	dist := firstNonEmpty(os.Getenv("VORTEXO_WEB_DIST"), "web/dist")
+	indexPath := filepath.Join(dist, "index.html")
+	if _, err := os.Stat(indexPath); err != nil {
+		return false
+	}
+
+	if r.URL.Path != "/" {
+		name := strings.TrimPrefix(filepath.Clean(r.URL.Path), "/")
+		if name != "." && !strings.HasPrefix(name, "..") {
+			path := filepath.Join(dist, name)
+			if info, err := os.Stat(path); err == nil && !info.IsDir() {
+				http.ServeFile(w, r, path)
+				return true
+			}
+		}
+	}
+	http.ServeFile(w, r, indexPath)
+	return true
+}
+
 func (s *appState) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	respondJSON(w, http.StatusOK, map[string]any{"ok": true, "name": "Vortexo Manifest Server"})
+	respondJSON(w, http.StatusOK, map[string]any{"ok": true, "name": "Vortexo Add-on Server"})
 }
 
 func (s *appState) handleAuthStatus(w http.ResponseWriter, _ *http.Request) {
@@ -1049,7 +1107,7 @@ func (s *appState) handleVortexoWatchState(w http.ResponseWriter, r *http.Reques
 
 func (s *appState) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]any{
-		"name":                 "Vortexo Manifest Server",
+		"name":                 "Vortexo Add-on Server",
 		"home":                 true,
 		"source_api":           true,
 		"playback":             true,
@@ -1061,6 +1119,77 @@ func (s *appState) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 		"manifest_bridge":      true,
 		"requires_app_changes": false,
 		"types":                []string{"movie", "show", "season", "episode", "live_tv", "watch_history"},
+	})
+}
+
+func (s *appState) handleBridgeDashboard(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	s.mu.RLock()
+	installed := append([]installedManifest(nil), s.config.Manifests...)
+	watch := s.config.Watch
+	watchCount := len(s.watchState.Items)
+	watchUpdatedAt := s.watchState.UpdatedAt
+	s.mu.RUnlock()
+
+	manifests := make([]dashboardManifest, 0, len(installed))
+	for _, item := range installed {
+		entry := dashboardManifest{
+			ID:        item.ID,
+			Name:      item.Name,
+			URL:       item.URL,
+			Enabled:   item.Enabled,
+			CreatedAt: item.CreatedAt,
+			UpdatedAt: item.UpdatedAt,
+			Status:    "disabled",
+			Resources: []string{},
+			Types:     []string{},
+			Catalogs:  []dashboardManifestCatalog{},
+		}
+		if !item.Enabled {
+			manifests = append(manifests, entry)
+			continue
+		}
+
+		manifest, _, err := s.fetchManifest(r.Context(), item.URL, false)
+		if err != nil {
+			entry.Status = "error"
+			entry.Message = err.Error()
+			manifests = append(manifests, entry)
+			continue
+		}
+
+		entry.Status = "ok"
+		entry.Name = firstNonEmpty(item.Name, manifest.Name, entry.ID)
+		entry.Description = manifest.Description
+		entry.Version = manifest.Version
+		entry.Logo = manifest.Logo
+		entry.Resources = manifestResourceNames(manifest)
+		entry.Types = append([]string(nil), manifest.Types...)
+		entry.Capabilities = manifestCapabilities(manifest)
+		entry.Catalogs = dashboardCatalogs(manifest)
+		manifests = append(manifests, entry)
+	}
+
+	respondJSON(w, http.StatusOK, map[string]any{
+		"server": map[string]any{
+			"name": "Vortexo Add-on Server",
+			"time": time.Now().UTC(),
+		},
+		"manifests": manifests,
+		"watch": map[string]any{
+			"count":               watchCount,
+			"updated_at":          watchUpdatedAt,
+			"trakt_connected":     watch.Trakt.AccessToken != "",
+			"trakt_last_sync_at":  watch.Trakt.LastSyncAt,
+			"plex_connected":      watch.Plex.Token != "",
+			"plex_last_sync_at":   watch.Plex.LastSyncAt,
+			"plex_server_url":     watch.Plex.ServerURL,
+			"trakt_client_config": watch.Trakt.ClientID != "",
+		},
 	})
 }
 
@@ -1357,7 +1486,7 @@ func (s *appState) handleXMLTV(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=300")
-	_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><tv generator-info-name="Vortexo Manifest Server"></tv>`))
+	_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><tv generator-info-name="Vortexo Add-on Server"></tv>`))
 }
 
 func (s *appState) handleLivePlayback(w http.ResponseWriter, r *http.Request) {
@@ -1901,7 +2030,7 @@ func (s *appState) handleXtreamPlayerAPI(w http.ResponseWriter, r *http.Request)
 				"status": "Active",
 			},
 			"server_info": map[string]any{
-				"server_name": "Vortexo Manifest Server",
+				"server_name": "Vortexo Add-on Server",
 			},
 		})
 	case "get_vod_info":
@@ -2268,7 +2397,7 @@ func (s *appState) syncPlexWatchState(ctx context.Context) ([]watchStateItem, er
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/json, application/xml;q=0.8, */*;q=0.1")
-	req.Header.Set("X-Plex-Product", "Vortexo Manifest Server")
+	req.Header.Set("X-Plex-Product", "Vortexo Add-on Server")
 	req.Header.Set("X-Plex-Client-Identifier", "vortexo-manifest-server")
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -3525,6 +3654,77 @@ func manifestSupportsResource(manifest stremioManifest, wanted string) bool {
 	return false
 }
 
+func manifestResourceNames(manifest stremioManifest) []string {
+	seen := map[string]bool{}
+	var names []string
+	for _, raw := range manifest.Resources {
+		name := ""
+		switch value := raw.(type) {
+		case string:
+			name = value
+		case map[string]any:
+			name = fmt.Sprint(value["name"])
+		}
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func manifestCapabilities(manifest stremioManifest) []string {
+	var out []string
+	for _, resource := range []string{"catalog", "meta", "stream", "subtitles"} {
+		if manifestSupportsResource(manifest, resource) {
+			out = append(out, resource)
+		}
+	}
+	if hasLiveManifestCatalog(manifest) {
+		out = append(out, "live_tv")
+	}
+	return out
+}
+
+func dashboardCatalogs(manifest stremioManifest) []dashboardManifestCatalog {
+	catalogs := make([]dashboardManifestCatalog, 0, len(manifest.Catalogs))
+	for _, catalog := range manifest.Catalogs {
+		item := dashboardManifestCatalog{
+			Type: catalog.Type,
+			ID:   catalog.ID,
+			Name: catalog.Name,
+		}
+		for _, extra := range catalog.Extra {
+			name := strings.TrimSpace(extra.Name)
+			if name == "" {
+				continue
+			}
+			if strings.EqualFold(name, "search") {
+				item.Search = true
+			}
+			if extra.IsRequired {
+				item.RequiredExtras = append(item.RequiredExtras, name)
+			} else {
+				item.OptionalExtras = append(item.OptionalExtras, name)
+			}
+		}
+		catalogs = append(catalogs, item)
+	}
+	return catalogs
+}
+
+func hasLiveManifestCatalog(manifest stremioManifest) bool {
+	for _, catalog := range manifest.Catalogs {
+		if isLiveCatalog(manifest, installedManifest{}, catalog) {
+			return true
+		}
+	}
+	return false
+}
+
 func manifestSupportsType(manifest stremioManifest, wanted string) bool {
 	wanted = normalizeStremioType(wanted)
 	if wanted == "" || len(manifest.Types) == 0 {
@@ -4462,7 +4662,7 @@ const indexHTML = `<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Vortexo Manifest Server</title>
+  <title>Vortexo Add-on Server</title>
   <style>
     :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #090812; color: #f7f6ff; }
     * { box-sizing: border-box; }
@@ -4529,8 +4729,8 @@ const indexHTML = `<!doctype html>
     <div class="brand">
       <div class="brandMark">V</div>
       <div>
-        <h1>Vortexo Manifest Server</h1>
-        <div class="subtitle">Manifest setup wizard</div>
+        <h1>Vortexo Add-on Server</h1>
+        <div class="subtitle">Add-on setup wizard</div>
       </div>
     </div>
     <div class="steps">
@@ -4544,21 +4744,21 @@ const indexHTML = `<!doctype html>
       <button class="step" data-step="finish" onclick="showStep('finish')"><span class="dot"></span><span>Finish</span></button>
     </div>
     <div class="fineprint">
-      Vortexo Manifest Server stores installed manifest URLs and optional watch-sync credentials locally on this server.
+      Vortexo Add-on Server stores installed manifest URLs and optional watch-sync credentials locally on this server.
     </div>
   </aside>
   <main>
     <div class="topbar">
       <div>
         <div class="subtitle">First-run setup for Vortexo Apple TV</div>
-        <h1>Build your manifest-powered server</h1>
+        <h1>Build your add-on-powered server</h1>
       </div>
       <div id="authPill" class="statusPill">Signed out</div>
     </div>
     <section class="stage">
       <div id="welcome" class="pane active">
         <div class="panel hero">
-          <h2>Welcome to Vortexo Manifest Server</h2>
+          <h2>Welcome to Vortexo Add-on Server</h2>
           <p>This wizard helps you turn a clean server into a working Vortexo backend. You create or paste AIOStreams and AIOMetadata manifests, then the Apple TV app keeps using the same Vortexo Server settings you already have.</p>
           <div class="grid" style="text-align:left; margin-top:24px;">
             <div class="card">
@@ -4602,7 +4802,7 @@ const indexHTML = `<!doctype html>
       <div id="accounts" class="pane">
         <div class="panel">
           <h2>Prepare Accounts and Keys</h2>
-          <p class="muted">Enter your own keys here and Vortexo Manifest Server will create AIOMetadata and AIOStreams manifests for you. Keys are sent to the selected upstream addon instance to create its normal manifest configuration; Vortexo Manifest Server stores only the returned manifest URLs.</p>
+          <p class="muted">Enter your own keys here and Vortexo Add-on Server will create AIOMetadata and AIOStreams manifests for you. Keys are sent to the selected upstream addon instance to create its normal manifest configuration; Vortexo Add-on Server stores only the returned manifest URLs.</p>
           <div class="checklist">
             <label class="check"><input type="checkbox" data-check="debrid"><span><strong>Debrid account</strong><br><span class="muted">Real-Debrid, TorBox, Premiumize, AllDebrid, or another provider supported by your AIOStreams instance.</span></span></label>
             <label class="check"><input type="checkbox" data-check="tmdb"><span><strong>TMDB key</strong><br><span class="muted">Helps metadata and catalog quality when your AIOMetadata instance requests it.</span></span></label>
@@ -4747,7 +4947,7 @@ const indexHTML = `<!doctype html>
       <div id="watch" class="pane">
         <div class="panel">
           <h2>Watch History Import</h2>
-          <p class="muted">Optional. Import watched state and resume progress into this Vortexo Manifest Server. The Apple TV app can read this normalized local state after app-side integration.</p>
+          <p class="muted">Optional. Import watched state and resume progress into this Vortexo Add-on Server. The Apple TV app can read this normalized local state after app-side integration.</p>
           <div class="grid">
             <div class="card">
               <h3>Trakt</h3>
@@ -4790,7 +4990,7 @@ const indexHTML = `<!doctype html>
 
       <div id="install" class="pane">
         <div class="panel">
-          <h2>Install Into Vortexo Manifest Server</h2>
+          <h2>Install Into Vortexo Add-on Server</h2>
           <p class="muted">Sign in first, then install one or both manifest URLs. You can come back later and replace them without changing the Apple TV app.</p>
           <div class="two">
             <div>
