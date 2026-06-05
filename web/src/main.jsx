@@ -60,6 +60,13 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [watchStatus, setWatchStatus] = useState("");
+  const [plexSettings, setPlexSettings] = useState({});
+  const [plexAccessToken, setPlexAccessToken] = useState("");
+  const [plexStatus, setPlexStatus] = useState("");
+  const [plexPin, setPlexPin] = useState(() => {
+    const id = Number(localStorage.getItem("vortexoPlexPinID") || 0);
+    return id > 0 ? { id } : null;
+  });
   const [login, setLogin] = useState({ username: "vortexo", password: "vortexo" });
   const [manual, setManual] = useState({ name: "", url: "" });
   const [registry, setRegistry] = useState({
@@ -116,6 +123,7 @@ function App() {
     if (token) {
       loadDashboard(token);
       loadWatchSettings(token);
+      loadPlexSettings(token);
     }
   }, [token]);
 
@@ -199,6 +207,20 @@ function App() {
         ...current,
         traktClientId: data.trakt?.client_id || "",
       }));
+    } catch {
+      // Optional panel; keep the dashboard usable.
+    }
+  }
+
+  async function loadPlexSettings(activeToken = token) {
+    if (!activeToken) return;
+    try {
+      const res = await fetch("/api/v1/bridge/plex/settings", {
+        headers: { authorization: `Bearer ${activeToken}` },
+      });
+      const data = await res.json();
+      if (!res.ok) return;
+      setPlexSettings(data.plex || {});
     } catch {
       // Optional panel; keep the dashboard usable.
     }
@@ -487,6 +509,118 @@ function App() {
     }
   }
 
+  async function savePlexToken(event) {
+    event.preventDefault();
+    const accessToken = plexAccessToken.trim();
+    if (!accessToken) {
+      setPlexStatus("Paste a Plex token or use PIN login.");
+      return;
+    }
+    setBusy(true);
+    setPlexStatus("Saving Plex token...");
+    try {
+      const data = await request("/api/v1/bridge/plex/settings", {
+        method: "POST",
+        body: JSON.stringify({ access_token: accessToken }),
+      });
+      setPlexSettings(data.plex || {});
+      setPlexAccessToken("");
+      setMessage("Plex connected");
+      setPlexStatus("Plex connected. Discover landscapes will be used by the artwork cache.");
+    } catch (error) {
+      setMessage(error.message);
+      setPlexStatus(error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function clearPlexToken() {
+    setBusy(true);
+    setPlexStatus("Clearing Plex token...");
+    try {
+      const data = await request("/api/v1/bridge/plex/settings", {
+        method: "POST",
+        body: JSON.stringify({ clear_token: true }),
+      });
+      setPlexSettings(data.plex || {});
+      setPlexAccessToken("");
+      setPlexPin(null);
+      localStorage.removeItem("vortexoPlexPinID");
+      setMessage("Plex disconnected");
+      setPlexStatus("Plex token cleared. Cards will fall back to public artwork and background-plus-logo layouts.");
+    } catch (error) {
+      setMessage(error.message);
+      setPlexStatus(error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function startPlexLogin() {
+    setBusy(true);
+    setPlexStatus("Requesting Plex PIN...");
+    try {
+      const data = await request("/api/v1/bridge/plex/pin", { method: "POST" });
+      setPlexPin(data);
+      localStorage.setItem("vortexoPlexPinID", String(data.id || ""));
+      setPlexStatus(`Open Plex login and enter code ${data.code || ""}. Then click Check Login.`);
+    } catch (error) {
+      setMessage(error.message);
+      setPlexStatus(error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function checkPlexLogin() {
+    const pinID = Number(plexPin?.id || localStorage.getItem("vortexoPlexPinID") || 0);
+    if (!pinID) {
+      setPlexStatus("Start Plex PIN login first.");
+      return;
+    }
+    setBusy(true);
+    setPlexStatus("Checking Plex login...");
+    try {
+      const data = await request("/api/v1/bridge/plex/pin/token", {
+        method: "POST",
+        body: JSON.stringify({ pin_id: pinID }),
+      });
+      if (!data.authenticated) {
+        setPlexStatus("Still waiting for Plex approval.");
+        return;
+      }
+      setPlexSettings(data.plex || {});
+      setPlexPin(null);
+      localStorage.removeItem("vortexoPlexPinID");
+      setMessage("Plex connected");
+      setPlexStatus("Plex connected. Discover landscapes will be used by the artwork cache.");
+    } catch (error) {
+      setMessage(error.message);
+      setPlexStatus(error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refreshArtwork() {
+    setBusy(true);
+    setPlexStatus("Starting artwork refresh...");
+    try {
+      const data = await request("/api/v1/artwork/refresh", {
+        method: "POST",
+        body: JSON.stringify({ limit: 2000 }),
+      });
+      setMessage(data.message || "Artwork refresh started");
+      setPlexStatus(`${data.message || "Artwork refresh started"}. Give it a minute, then refresh Vortexo Home.`);
+    } catch (error) {
+      setMessage(error.message);
+      setPlexStatus(error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function copyServerURL() {
     await navigator.clipboard?.writeText(serverUrl);
     setMessage("Server URL copied");
@@ -597,6 +731,16 @@ function App() {
                 status={watchStatus}
                 onSave={saveWatch}
                 onSync={syncWatch}
+                plex={plexSettings}
+                plexAccessToken={plexAccessToken}
+                setPlexAccessToken={setPlexAccessToken}
+                plexPin={plexPin}
+                plexStatus={plexStatus}
+                onSavePlex={savePlexToken}
+                onClearPlex={clearPlexToken}
+                onStartPlex={startPlexLogin}
+                onCheckPlex={checkPlexLogin}
+                onRefreshArtwork={refreshArtwork}
                 busy={busy}
               />
             )}
@@ -1020,13 +1164,37 @@ function Setup({ perfect, setPerfect, onSubmit, busy }) {
   );
 }
 
-function WatchSync({ watch, form, setForm, status, onSave, onSync, busy }) {
+function WatchSync({
+  watch,
+  form,
+  setForm,
+  status,
+  onSave,
+  onSync,
+  plex,
+  plexAccessToken,
+  setPlexAccessToken,
+  plexPin,
+  plexStatus,
+  onSavePlex,
+  onClearPlex,
+  onStartPlex,
+  onCheckPlex,
+  onRefreshArtwork,
+  busy,
+}) {
   const hasTraktConfig = Boolean(watch.trakt_client_config || form.traktClientId.trim());
+  const connectedAccounts = [
+    watch.trakt_connected ? "Trakt" : "",
+    plex?.has_access_token ? "Plex" : "",
+  ].filter(Boolean);
+  const plexName = plex?.username || plex?.title || plex?.email || "";
+  const plexLink = plexPin?.authorization_url || plexPin?.verification_url || "https://plex.tv/link";
   return (
     <section className="stack">
       <div className="metric-grid two-cols">
         <Metric icon={Eye} label="Watch items" value={watch.count || 0} detail="Local normalized state" />
-        <Metric icon={BadgeCheck} label="Connections" value={watch.trakt_connected ? 1 : 0} detail="Trakt" />
+        <Metric icon={BadgeCheck} label="Connections" value={connectedAccounts.length} detail={connectedAccounts.join(", ") || "None"} />
       </div>
       <form className="panel" onSubmit={onSave}>
         <div className="section-head">
@@ -1046,6 +1214,44 @@ function WatchSync({ watch, form, setForm, status, onSave, onSync, busy }) {
           <button type="button" className="secondary" onClick={onSync} disabled={busy || !hasTraktConfig}>Sync Trakt</button>
         </div>
         {status && <div className={isErrorMessage(status) ? "inline-error" : "inline-note"}>{status}</div>}
+      </form>
+      <form className="panel" onSubmit={onSavePlex}>
+        <div className="section-head">
+          <div>
+            <p className="eyebrow">Artwork</p>
+            <h2>Plex Discover landscapes</h2>
+            <p className="muted">
+              {plex?.has_access_token
+                ? `Connected${plexName ? ` as ${plexName}` : ""}.`
+                : "Connect Plex so add-on media can use enhanced Discover 16:9 art."}
+            </p>
+          </div>
+          <span className={plex?.has_access_token ? "small-status ok" : "small-status warn"}>
+            {plex?.has_access_token ? "Connected" : "Missing"}
+          </span>
+        </div>
+        <TextField
+          label="Plex access token"
+          type="password"
+          value={plexAccessToken}
+          onChange={setPlexAccessToken}
+          placeholder="Paste token, or use PIN login"
+          help="The server stores the token locally and uses it only for Plex Discover artwork lookup."
+        />
+        <div className="form-actions">
+          <button type="button" className="secondary" onClick={onStartPlex} disabled={busy}>Plex PIN Login</button>
+          <button type="button" className="secondary" onClick={onCheckPlex} disabled={busy || !plexPin?.id}>Check Login</button>
+          <button type="submit" disabled={busy || !plexAccessToken.trim()}>Save Token</button>
+          <button type="button" className="secondary" onClick={onRefreshArtwork} disabled={busy || !plex?.has_access_token}>Refresh Artwork</button>
+          <button type="button" className="secondary" onClick={onClearPlex} disabled={busy || !plex?.has_access_token}>Clear</button>
+        </div>
+        {plexPin?.code && (
+          <div className="inline-note">
+            Open <a className="text-link" href={plexLink} target="_blank" rel="noreferrer">Plex login <ExternalLink size={14} /></a>
+            {" "}and enter code <strong>{plexPin.code}</strong>. Then click Check Login.
+          </div>
+        )}
+        {plexStatus && <div className={isErrorMessage(plexStatus) ? "inline-error" : "inline-note"}>{plexStatus}</div>}
       </form>
     </section>
   );
