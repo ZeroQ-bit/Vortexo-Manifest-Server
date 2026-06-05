@@ -30,6 +30,11 @@ const (
 	defaultUsername                 = "vortexo"
 	defaultPassword                 = "vortexo"
 	defaultRegistryURL              = "https://stremio-addons.net/api/manifest.json"
+	plexProduct                     = "Vortexo Manifest Server"
+	plexVersion                     = "1.0.0"
+	plexPlatform                    = "Go"
+	plexDevice                      = "Server"
+	plexDeviceName                  = "Vortexo Manifest Server"
 	watchStateEnrichmentLimit       = 48
 	watchStateEnrichmentConcurrency = 6
 	watchStateMetadataTimeout       = 6 * time.Second
@@ -66,7 +71,23 @@ type bridgeConfig struct {
 	AddonRegistryURL string              `json:"addon_registry_url,omitempty"`
 	Manifests        []installedManifest `json:"manifests"`
 	Catalogs         []catalogPreference `json:"catalogs,omitempty"`
+	Plex             plexAuthConfig      `json:"plex,omitempty"`
 	Watch            watchSyncConfig     `json:"watch,omitempty"`
+}
+
+type plexAuthConfig struct {
+	ClientID       string    `json:"client_id,omitempty"`
+	AccessToken    string    `json:"access_token,omitempty"`
+	UserID         int       `json:"user_id,omitempty"`
+	Username       string    `json:"username,omitempty"`
+	Email          string    `json:"email,omitempty"`
+	Title          string    `json:"title,omitempty"`
+	LastSignedInAt time.Time `json:"last_signed_in_at,omitempty"`
+}
+
+type plexQueryItem struct {
+	Name  string
+	Value string
 }
 
 type watchSyncConfig struct {
@@ -614,6 +635,68 @@ type plexArtworkSeedItem struct {
 	Year      int
 }
 
+type plexDiscoverImage struct {
+	Alt  string `json:"alt,omitempty"`
+	Type string `json:"type,omitempty"`
+	URL  string `json:"url,omitempty"`
+}
+
+type plexDiscoverGuid struct {
+	ID string `json:"id,omitempty"`
+}
+
+type plexDiscoverMetadata struct {
+	RatingKey             string              `json:"ratingKey,omitempty"`
+	Key                   string              `json:"key,omitempty"`
+	GUID                  string              `json:"guid,omitempty"`
+	PrimaryGUID           string              `json:"primaryGuid,omitempty"`
+	Type                  string              `json:"type,omitempty"`
+	Title                 string              `json:"title,omitempty"`
+	OriginalTitle         string              `json:"originalTitle,omitempty"`
+	Year                  int                 `json:"year,omitempty"`
+	OriginallyAvailableAt string              `json:"originallyAvailableAt,omitempty"`
+	PublicPagesURL        string              `json:"publicPagesURL,omitempty"`
+	Slug                  string              `json:"slug,omitempty"`
+	Thumb                 string              `json:"thumb,omitempty"`
+	Art                   string              `json:"art,omitempty"`
+	Banner                string              `json:"banner,omitempty"`
+	Image                 []plexDiscoverImage `json:"Image,omitempty"`
+	Guid                  []plexDiscoverGuid  `json:"Guid,omitempty"`
+}
+
+type plexDiscoverSearchResponse struct {
+	MediaContainer struct {
+		SearchResults []struct {
+			SearchResult []struct {
+				Metadata *plexDiscoverMetadata `json:"Metadata"`
+			} `json:"SearchResult"`
+		} `json:"SearchResults"`
+	} `json:"MediaContainer"`
+}
+
+type plexDiscoverMetadataResponse struct {
+	MediaContainer struct {
+		Metadata []plexDiscoverMetadata `json:"Metadata"`
+	} `json:"MediaContainer"`
+}
+
+type plexPin struct {
+	ID        int    `json:"id"`
+	Code      string `json:"code"`
+	AuthToken string `json:"authToken"`
+	ExpiresIn int    `json:"expiresIn"`
+	ExpiresAt string `json:"expiresAt"`
+	QR        string `json:"qr"`
+}
+
+type plexUser struct {
+	ID       int    `json:"id"`
+	UUID     string `json:"uuid"`
+	Username string `json:"username"`
+	Email    string `json:"email"`
+	Title    string `json:"title"`
+}
+
 type plexArtworkSyncStats struct {
 	Limit       int       `json:"limit"`
 	Attempted   int       `json:"attempted"`
@@ -649,6 +732,15 @@ type traktDeviceCodeRequest struct {
 
 type traktDeviceTokenRequest struct {
 	DeviceCode string `json:"device_code"`
+}
+
+type plexSettingsRequest struct {
+	AccessToken string `json:"access_token"`
+	ClearToken  bool   `json:"clear_token"`
+}
+
+type plexPinTokenRequest struct {
+	PinID int `json:"pin_id"`
 }
 
 type playToken struct {
@@ -804,6 +896,9 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/bridge/watch/trakt/device-code", s.requireAuth(s.handleTraktDeviceCode))
 	mux.HandleFunc("/api/v1/bridge/watch/trakt/device-token", s.requireAuth(s.handleTraktDeviceToken))
 	mux.HandleFunc("/api/v1/bridge/watch/trakt/sync", s.requireAuth(s.handleTraktWatchSync))
+	mux.HandleFunc("/api/v1/bridge/plex/settings", s.requireAuth(s.handlePlexSettings))
+	mux.HandleFunc("/api/v1/bridge/plex/pin", s.requireAuth(s.handlePlexPIN))
+	mux.HandleFunc("/api/v1/bridge/plex/pin/token", s.requireAuth(s.handlePlexPINToken))
 	mux.HandleFunc("/api/v1/movies", s.handleMovies)
 	mux.HandleFunc("/api/v1/movies/", s.handleMovieByID)
 	mux.HandleFunc("/api/v1/series", s.handleSeries)
@@ -855,6 +950,15 @@ func (s *appState) load() error {
 	}
 	if s.config.AddonRegistryURL == "" {
 		s.config.AddonRegistryURL = defaultRegistryURL
+		changed = true
+	}
+	if s.config.Plex.ClientID == "" {
+		s.config.Plex.ClientID = randomToken()
+		changed = true
+	}
+	if token := strings.TrimSpace(firstNonEmpty(os.Getenv("VORTEXO_PLEX_TOKEN"), os.Getenv("PLEX_TOKEN"))); token != "" && token != s.config.Plex.AccessToken {
+		s.config.Plex.AccessToken = token
+		s.config.Plex.LastSignedInAt = time.Now().UTC()
 		changed = true
 	}
 	if s.config.Manifests == nil {
@@ -1175,6 +1279,141 @@ func (s *appState) handleWatchSettings(w http.ResponseWriter, r *http.Request) {
 	default:
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func (s *appState) handlePlexSettings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.mu.RLock()
+		plex := s.config.Plex
+		s.mu.RUnlock()
+		respondJSON(w, http.StatusOK, map[string]any{
+			"plex": plexSettingsResponse(plex),
+		})
+	case http.MethodPost:
+		var req plexSettingsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			respondError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+
+		accessToken := strings.TrimSpace(req.AccessToken)
+		var user *plexUser
+		if !req.ClearToken && accessToken != "" {
+			fetched, err := s.fetchPlexUser(r.Context(), accessToken)
+			if err != nil {
+				respondError(w, http.StatusBadGateway, "Plex token validation failed: "+err.Error())
+				return
+			}
+			user = fetched
+		}
+
+		s.mu.Lock()
+		if req.ClearToken {
+			s.config.Plex.AccessToken = ""
+			s.config.Plex.UserID = 0
+			s.config.Plex.Username = ""
+			s.config.Plex.Email = ""
+			s.config.Plex.Title = ""
+			s.config.Plex.LastSignedInAt = time.Time{}
+		} else if accessToken != "" {
+			s.config.Plex.AccessToken = accessToken
+			s.applyPlexUserLocked(user)
+			s.config.Plex.LastSignedInAt = time.Now().UTC()
+		}
+		plex := s.config.Plex
+		err := s.saveLocked()
+		s.mu.Unlock()
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, "failed to save Plex settings")
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"ok": true, "plex": plexSettingsResponse(plex)})
+	default:
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *appState) handlePlexPIN(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	pin, err := s.createPlexPIN(r.Context())
+	if err != nil {
+		respondError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	clientID := s.plexClientID()
+	authURL := plexAuthURL(clientID, pin.Code)
+	respondJSON(w, http.StatusOK, map[string]any{
+		"id":                pin.ID,
+		"code":              pin.Code,
+		"expires_in":        pin.ExpiresIn,
+		"expires_at":        pin.ExpiresAt,
+		"qr":                pin.QR,
+		"verification_url":  "https://plex.tv/link",
+		"authorization_url": authURL,
+	})
+}
+
+func (s *appState) handlePlexPINToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req plexPinTokenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.PinID <= 0 {
+		respondError(w, http.StatusBadRequest, "pin_id is required")
+		return
+	}
+
+	pin, err := s.getPlexPIN(r.Context(), req.PinID)
+	if err != nil {
+		respondError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	token := strings.TrimSpace(pin.AuthToken)
+	if token == "" {
+		respondJSON(w, http.StatusOK, map[string]any{
+			"ok":            true,
+			"authenticated": false,
+			"pin": map[string]any{
+				"id":         pin.ID,
+				"code":       pin.Code,
+				"expires_in": pin.ExpiresIn,
+				"expires_at": pin.ExpiresAt,
+			},
+		})
+		return
+	}
+
+	user, err := s.fetchPlexUser(r.Context(), token)
+	if err != nil {
+		respondError(w, http.StatusBadGateway, "Plex token validation failed: "+err.Error())
+		return
+	}
+
+	s.mu.Lock()
+	s.config.Plex.AccessToken = token
+	s.applyPlexUserLocked(user)
+	s.config.Plex.LastSignedInAt = time.Now().UTC()
+	plex := s.config.Plex
+	err = s.saveLocked()
+	s.mu.Unlock()
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "failed to save Plex token")
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{
+		"ok":            true,
+		"authenticated": true,
+		"plex":          plexSettingsResponse(plex),
+	})
 }
 
 func (s *appState) handleTraktDeviceCode(w http.ResponseWriter, r *http.Request) {
@@ -3488,6 +3727,210 @@ func (s *appState) postJSON(ctx context.Context, rawURL string, payload any, tar
 	return nil
 }
 
+func plexSettingsResponse(plex plexAuthConfig) map[string]any {
+	return map[string]any{
+		"client_id":         plex.ClientID,
+		"has_access_token":  strings.TrimSpace(plex.AccessToken) != "",
+		"user_id":           plex.UserID,
+		"username":          plex.Username,
+		"email":             plex.Email,
+		"title":             plex.Title,
+		"last_signed_in_at": plex.LastSignedInAt,
+	}
+}
+
+func (s *appState) applyPlexUserLocked(user *plexUser) {
+	if user == nil {
+		return
+	}
+	s.config.Plex.UserID = user.ID
+	s.config.Plex.Username = strings.TrimSpace(user.Username)
+	s.config.Plex.Email = strings.TrimSpace(user.Email)
+	s.config.Plex.Title = strings.TrimSpace(user.Title)
+}
+
+func (s *appState) plexClientID() string {
+	s.mu.RLock()
+	clientID := strings.TrimSpace(s.config.Plex.ClientID)
+	s.mu.RUnlock()
+	if clientID != "" {
+		return clientID
+	}
+
+	clientID = randomToken()
+	s.mu.Lock()
+	if strings.TrimSpace(s.config.Plex.ClientID) == "" {
+		s.config.Plex.ClientID = clientID
+		_ = s.saveLocked()
+	} else {
+		clientID = s.config.Plex.ClientID
+	}
+	s.mu.Unlock()
+	return clientID
+}
+
+func (s *appState) plexAccountToken() string {
+	s.mu.RLock()
+	token := strings.TrimSpace(s.config.Plex.AccessToken)
+	s.mu.RUnlock()
+	return token
+}
+
+func (s *appState) plexAuthHeaders(token string) map[string]string {
+	headers := map[string]string{
+		"Accept":                   "application/json",
+		"User-Agent":               "VortexoManifestServer/1.0",
+		"X-Plex-Product":           plexProduct,
+		"X-Plex-Version":           plexVersion,
+		"X-Plex-Platform":          plexPlatform,
+		"X-Plex-Device":            plexDevice,
+		"X-Plex-Device-Name":       plexDeviceName,
+		"X-Plex-Client-Identifier": s.plexClientID(),
+	}
+	if strings.TrimSpace(token) != "" {
+		headers["X-Plex-Token"] = strings.TrimSpace(token)
+	}
+	return headers
+}
+
+func (s *appState) plexDiscoverHeaders(token string) map[string]string {
+	return map[string]string{
+		"Accept":                          "application/json",
+		"User-Agent":                      "VortexoManifestServer/1.0",
+		"X-Plex-Product":                  "Plex HTPC",
+		"X-Plex-Version":                  "5.92.0",
+		"X-Plex-Platform":                 "macOS",
+		"X-Plex-Platform-Version":         "15.5.0",
+		"X-Plex-Model":                    "Mac",
+		"X-Plex-Device":                   "Mac",
+		"X-Plex-Device-Name":              "Mac",
+		"X-Plex-Device-Vendor":            "Apple",
+		"X-Plex-Device-Screen-Resolution": "1920x1080",
+		"X-Plex-Drm":                      "widevine:video",
+		"X-Plex-Language":                 "en",
+		"X-Plex-Features":                 "external-media,indirect-media",
+		"X-Plex-Client-Identifier":        s.plexClientID(),
+		"X-Plex-Token":                    token,
+	}
+}
+
+func (s *appState) plexDiscoverQueryItems(token string) []plexQueryItem {
+	return []plexQueryItem{
+		{Name: "X-Plex-Product", Value: "Plex HTPC"},
+		{Name: "X-Plex-Version", Value: "5.92.0"},
+		{Name: "X-Plex-Platform", Value: "macOS"},
+		{Name: "X-Plex-Platform-Version", Value: "15.5.0"},
+		{Name: "X-Plex-Model", Value: "Mac"},
+		{Name: "X-Plex-Device", Value: "Mac"},
+		{Name: "X-Plex-Device-Name", Value: "Mac"},
+		{Name: "X-Plex-Device-Vendor", Value: "Apple"},
+		{Name: "X-Plex-Device-Screen-Resolution", Value: "1920x1080"},
+		{Name: "X-Plex-Drm", Value: "widevine:video"},
+		{Name: "X-Plex-Language", Value: "en"},
+		{Name: "X-Plex-Features", Value: "external-media,indirect-media"},
+		{Name: "X-Plex-Client-Identifier", Value: s.plexClientID()},
+		{Name: "X-Plex-Token", Value: token},
+	}
+}
+
+func (s *appState) plexJSON(ctx context.Context, method string, rawURL string, body io.Reader, headers map[string]string, target any, okStatuses ...int) error {
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, body)
+	if err != nil {
+		return err
+	}
+	for key, value := range headers {
+		if strings.TrimSpace(value) != "" {
+			req.Header.Set(key, value)
+		}
+	}
+	if body != nil && req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
+	if err != nil {
+		return err
+	}
+	ok := resp.StatusCode >= 200 && resp.StatusCode < 300
+	if len(okStatuses) > 0 {
+		ok = false
+		for _, status := range okStatuses {
+			if resp.StatusCode == status {
+				ok = true
+				break
+			}
+		}
+	}
+	if !ok {
+		detail := responseMessage(data)
+		if detail != "" {
+			return fmt.Errorf("HTTP %d: %s", resp.StatusCode, detail)
+		}
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	if target != nil && len(data) > 0 {
+		if err := json.Unmarshal(data, target); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *appState) createPlexPIN(ctx context.Context) (*plexPin, error) {
+	var pin plexPin
+	if err := s.plexJSON(ctx, http.MethodPost, "https://plex.tv/api/v2/pins?strong=true", nil, s.plexAuthHeaders(""), &pin, http.StatusOK, http.StatusCreated); err != nil {
+		return nil, fmt.Errorf("Plex PIN request failed: %w", err)
+	}
+	if pin.ID <= 0 || strings.TrimSpace(pin.Code) == "" {
+		return nil, fmt.Errorf("Plex PIN response was missing id/code")
+	}
+	return &pin, nil
+}
+
+func (s *appState) getPlexPIN(ctx context.Context, pinID int) (*plexPin, error) {
+	var pin plexPin
+	rawURL := fmt.Sprintf("https://plex.tv/api/v2/pins/%d", pinID)
+	if err := s.plexJSON(ctx, http.MethodGet, rawURL, nil, s.plexAuthHeaders(""), &pin); err != nil {
+		return nil, fmt.Errorf("Plex PIN check failed: %w", err)
+	}
+	return &pin, nil
+}
+
+func (s *appState) fetchPlexUser(ctx context.Context, token string) (*plexUser, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil, fmt.Errorf("missing Plex token")
+	}
+	var user plexUser
+	if err := s.plexJSON(ctx, http.MethodGet, "https://plex.tv/api/v2/user", nil, s.plexAuthHeaders(token), &user); err != nil {
+		return nil, err
+	}
+	if user.ID == 0 && user.Username == "" && user.Email == "" && user.Title == "" {
+		return nil, fmt.Errorf("Plex user response was empty")
+	}
+	return &user, nil
+}
+
+func plexAuthURL(clientID, code string) string {
+	components := url.URL{
+		Scheme: "https",
+		Host:   "app.plex.tv",
+		Path:   "/auth",
+	}
+	query := url.Values{}
+	query.Set("clientID", clientID)
+	query.Set("code", code)
+	query.Set("context[device][product]", plexProduct)
+	components.Fragment = "?" + query.Encode()
+	return components.String()
+}
+
 func (s *appState) createAIOMetadataSetup(ctx context.Context, req aiometadataSetupRequest, password string) (generatedManifest, []string, error) {
 	instances := normalizedInstances(req.Instance, req.Instances, []string{
 		"https://aiometadata.viren070.me",
@@ -4375,7 +4818,7 @@ func (s *appState) refreshPlexArtworkSeed(ctx context.Context, item plexArtworkS
 	errorMessage := ""
 	if entry == nil || entry.Artwork.isEmpty() {
 		status = "miss"
-		errorMessage = "no public Plex artwork found"
+		errorMessage = "no Plex artwork found"
 		if err != nil {
 			errorMessage = err.Error()
 		}
@@ -4404,6 +4847,12 @@ func (s *appState) refreshPlexArtworkSeed(ctx context.Context, item plexArtworkS
 }
 
 func (s *appState) scrapePlexArtworkItem(ctx context.Context, item plexArtworkSeedItem, delay time.Duration) (*plexArtworkEntry, error) {
+	if signedEntry, err := s.fetchSignedPlexDiscoverArtworkItem(ctx, item); err != nil {
+		log.Printf("[PlexArtwork] signed Discover miss %s:%d %s: %v", item.MediaType, item.TMDBID, item.Title, err)
+	} else if signedEntry != nil && !signedEntry.Artwork.isEmpty() {
+		return signedEntry, nil
+	}
+
 	for _, pageURL := range candidatePlexArtworkURLs(item) {
 		body, err := s.fetchPlexArtworkPage(ctx, pageURL, delay)
 		if err != nil {
@@ -4433,6 +4882,138 @@ func (s *appState) scrapePlexArtworkItem(ctx context.Context, item plexArtworkSe
 		}, nil
 	}
 	return nil, nil
+}
+
+func (s *appState) fetchSignedPlexDiscoverArtworkItem(ctx context.Context, item plexArtworkSeedItem) (*plexArtworkEntry, error) {
+	token := s.plexAccountToken()
+	if token == "" {
+		return nil, nil
+	}
+	query := strings.TrimSpace(item.Title)
+	if query == "" {
+		return nil, nil
+	}
+
+	results, err := s.searchSignedPlexDiscoverMetadata(ctx, token, query, 12)
+	if err != nil {
+		return nil, err
+	}
+	match := bestPlexDiscoverSearchMatch(results, item)
+	if match == nil {
+		return nil, nil
+	}
+
+	metadata := *match
+	sourcePage := "plex-discover:search"
+	if discoverID := plexDiscoverMetadataID(metadata); discoverID != "" {
+		sourcePage = "https://discover.provider.plex.tv/library/metadata/" + discoverID
+		if hydrated, err := s.getSignedPlexDiscoverMetadata(ctx, token, discoverID); err == nil && hydrated != nil {
+			metadata = *hydrated
+		} else if err != nil {
+			log.Printf("[PlexArtwork] signed Discover metadata hydrate miss %s %s: %v", discoverID, item.Title, err)
+		}
+	}
+
+	artwork := plexArtworkFromDiscoverMetadata(metadata, token)
+	if artwork.isEmpty() {
+		return nil, nil
+	}
+
+	discoveredTMDB, discoveredIMDB := plexDiscoverExternalIDs(metadata, normalizePlexArtworkMediaType(item.MediaType))
+	return &plexArtworkEntry{
+		Version:    1,
+		MediaType:  normalizePlexArtworkMediaType(item.MediaType),
+		TMDBID:     firstNonZero(item.TMDBID, discoveredTMDB),
+		IMDBID:     firstNonEmpty(item.IMDBID, discoveredIMDB),
+		Title:      firstNonEmpty(item.Title, metadata.Title, metadata.OriginalTitle),
+		Year:       firstNonZero(item.Year, metadata.Year, yearFromText(metadata.OriginallyAvailableAt)),
+		SourcePage: sourcePage,
+		UpdatedAt:  time.Now().UTC(),
+		Artwork:    artwork,
+	}, nil
+}
+
+func (s *appState) searchSignedPlexDiscoverMetadata(ctx context.Context, token string, query string, limit int) ([]plexDiscoverMetadata, error) {
+	components, err := url.Parse("https://discover.provider.plex.tv/library/search")
+	if err != nil {
+		return nil, err
+	}
+	items := s.plexDiscoverQueryItems(token)
+	items = append(items,
+		plexQueryItem{Name: "searchTypes", Value: "movies,tv"},
+		plexQueryItem{Name: "searchProviders", Value: "discover"},
+		plexQueryItem{Name: "includeMetadata", Value: "1"},
+		plexQueryItem{Name: "includeGuids", Value: "1"},
+		plexQueryItem{Name: "includeImages", Value: "1"},
+		plexQueryItem{Name: "filterPeople", Value: "1"},
+		plexQueryItem{Name: "limit", Value: strconv.Itoa(maxInt(1, minInt(limit, 50)))},
+		plexQueryItem{Name: "query", Value: query},
+	)
+	values := url.Values{}
+	for _, item := range items {
+		values.Add(item.Name, item.Value)
+	}
+	components.RawQuery = values.Encode()
+
+	var response plexDiscoverSearchResponse
+	if err := s.plexJSON(ctx, http.MethodGet, components.String(), nil, s.plexDiscoverHeaders(token), &response); err != nil {
+		return nil, err
+	}
+
+	var results []plexDiscoverMetadata
+	seen := map[string]bool{}
+	for _, group := range response.MediaContainer.SearchResults {
+		for _, result := range group.SearchResult {
+			if result.Metadata == nil {
+				continue
+			}
+			meta := *result.Metadata
+			key := firstNonEmpty(plexDiscoverMetadataID(meta), meta.RatingKey, meta.Key, meta.GUID, meta.Title)
+			if key != "" {
+				key = strings.ToLower(key)
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+			}
+			results = append(results, meta)
+		}
+	}
+	return results, nil
+}
+
+func (s *appState) getSignedPlexDiscoverMetadata(ctx context.Context, token string, discoverID string) (*plexDiscoverMetadata, error) {
+	discoverID = strings.Trim(discoverID, "/")
+	if discoverID == "" {
+		return nil, fmt.Errorf("missing Discover metadata id")
+	}
+
+	components, err := url.Parse("https://discover.provider.plex.tv/library/metadata/" + url.PathEscape(discoverID))
+	if err != nil {
+		return nil, err
+	}
+	items := s.plexDiscoverQueryItems(token)
+	items = append(items,
+		plexQueryItem{Name: "includeMeta", Value: "1"},
+		plexQueryItem{Name: "includeExternalMetadata", Value: "1"},
+		plexQueryItem{Name: "includeGuids", Value: "1"},
+		plexQueryItem{Name: "includeImages", Value: "1"},
+		plexQueryItem{Name: "includeExternalMedia", Value: "1"},
+	)
+	values := url.Values{}
+	for _, item := range items {
+		values.Add(item.Name, item.Value)
+	}
+	components.RawQuery = values.Encode()
+
+	var response plexDiscoverMetadataResponse
+	if err := s.plexJSON(ctx, http.MethodGet, components.String(), nil, s.plexDiscoverHeaders(token), &response); err != nil {
+		return nil, err
+	}
+	if len(response.MediaContainer.Metadata) == 0 {
+		return nil, nil
+	}
+	return &response.MediaContainer.Metadata[0], nil
 }
 
 func (s *appState) fetchPlexArtworkPage(ctx context.Context, pageURL string, delay time.Duration) (string, error) {
@@ -4678,6 +5259,249 @@ func candidatePlexArtworkURLs(item plexArtworkSeedItem) []string {
 	return urls
 }
 
+func bestPlexDiscoverSearchMatch(results []plexDiscoverMetadata, item plexArtworkSeedItem) *plexDiscoverMetadata {
+	preferredType := plexDiscoverPreferredType(item.MediaType)
+	preferredTitle := normalizedSearchText(item.Title)
+	preferredIMDB := imdbFromID(item.IMDBID)
+
+	type scoredMatch struct {
+		metadata plexDiscoverMetadata
+		score    int
+	}
+	var matches []scoredMatch
+	for _, candidate := range results {
+		if plexDiscoverPreferredType(candidate.Type) != preferredType {
+			continue
+		}
+
+		candidateTMDB, candidateIMDB := plexDiscoverExternalIDs(candidate, normalizePlexArtworkMediaType(item.MediaType))
+		candidateTitle := normalizedSearchText(firstNonEmpty(candidate.Title, candidate.OriginalTitle))
+		exactTitle := preferredTitle != "" && candidateTitle != "" && candidateTitle == preferredTitle
+		partialTitle := preferredTitle != "" && candidateTitle != "" &&
+			(strings.Contains(candidateTitle, preferredTitle) || strings.Contains(preferredTitle, candidateTitle))
+
+		score := 0
+		if item.TMDBID > 0 && candidateTMDB == item.TMDBID {
+			score += 1000
+		}
+		if preferredIMDB != "" && strings.EqualFold(candidateIMDB, preferredIMDB) {
+			score += 950
+		}
+		if exactTitle {
+			score += 250
+		} else if partialTitle {
+			score += 100
+		}
+		if item.Year > 0 && candidate.Year == item.Year {
+			score += 50
+		} else if item.Year > 0 && yearFromText(candidate.OriginallyAvailableAt) == item.Year {
+			score += 50
+		}
+
+		if item.TMDBID > 0 || preferredIMDB != "" {
+			if item.TMDBID > 0 && candidateTMDB != item.TMDBID &&
+				(preferredIMDB == "" || !strings.EqualFold(candidateIMDB, preferredIMDB)) {
+				continue
+			}
+		}
+		if score <= 0 || (!exactTitle && !partialTitle && item.TMDBID == 0 && preferredIMDB == "") {
+			continue
+		}
+		matches = append(matches, scoredMatch{metadata: candidate, score: score})
+	}
+
+	sort.SliceStable(matches, func(i, j int) bool {
+		if matches[i].score == matches[j].score {
+			return strings.ToLower(matches[i].metadata.Title) < strings.ToLower(matches[j].metadata.Title)
+		}
+		return matches[i].score > matches[j].score
+	})
+	if len(matches) == 0 {
+		return nil
+	}
+	return &matches[0].metadata
+}
+
+func plexDiscoverPreferredType(mediaType string) string {
+	switch strings.ToLower(strings.TrimSpace(mediaType)) {
+	case "show", "series", "tv", "episode":
+		return "show"
+	default:
+		return "movie"
+	}
+}
+
+func plexDiscoverMetadataID(meta plexDiscoverMetadata) string {
+	for _, value := range []string{meta.RatingKey, meta.Key, meta.GUID, meta.PrimaryGUID} {
+		if id := normalizedPlexDiscoverMetadataID(value); id != "" {
+			return id
+		}
+	}
+	for _, guid := range meta.Guid {
+		if id := normalizedPlexDiscoverMetadataID(guid.ID); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+func normalizedPlexDiscoverMetadataID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	value = strings.ReplaceAll(value, `\u002F`, "/")
+	value = strings.ReplaceAll(value, `\/`, "/")
+	value = html.UnescapeString(value)
+
+	if strings.HasPrefix(strings.ToLower(value), "plex://") {
+		parts := strings.Split(strings.Trim(value, "/"), "/")
+		if len(parts) > 0 {
+			return strings.TrimSpace(parts[len(parts)-1])
+		}
+	}
+
+	if parsed, err := url.Parse(value); err == nil && parsed.Host != "" {
+		parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+		for i, part := range parts {
+			if part == "metadata" && i+1 < len(parts) {
+				return strings.TrimSpace(parts[i+1])
+			}
+		}
+	}
+
+	if idx := strings.Index(value, "/library/metadata/"); idx >= 0 {
+		rest := strings.Trim(value[idx+len("/library/metadata/"):], "/")
+		if rest != "" {
+			return strings.Split(rest, "/")[0]
+		}
+	}
+
+	if strings.Contains(value, "://") {
+		return ""
+	}
+	return strings.Trim(value, "/")
+}
+
+func plexDiscoverExternalIDs(meta plexDiscoverMetadata, preferredType string) (int, string) {
+	var values []string
+	values = append(values, meta.GUID, meta.PrimaryGUID, meta.RatingKey, meta.Key)
+	for _, guid := range meta.Guid {
+		values = append(values, guid.ID)
+	}
+
+	var tmdbID int
+	var imdbID string
+	for _, value := range values {
+		if imdbID == "" {
+			imdbID = imdbFromID(value)
+		}
+		if tmdbID == 0 {
+			tmdbID = tmdbIDFromDiscoverValue(value, preferredType)
+		}
+	}
+	return tmdbID, imdbID
+}
+
+func tmdbIDFromDiscoverValue(value string, preferredType string) int {
+	value = strings.TrimSpace(html.UnescapeString(value))
+	if value == "" {
+		return 0
+	}
+	lower := strings.ToLower(value)
+	if !strings.Contains(lower, "tmdb") && !strings.Contains(lower, "themoviedb") {
+		return 0
+	}
+
+	re := regexp.MustCompile(`(?i)(?:tmdb|themoviedb)://(?:movie|tv|show|series)/(\d+)`)
+	if matches := re.FindStringSubmatch(value); len(matches) == 2 {
+		id, _ := strconv.Atoi(matches[1])
+		return id
+	}
+
+	if preferredType != "" {
+		typeKey := "movie"
+		if normalizePlexArtworkMediaType(preferredType) == "tv" || preferredType == "show" {
+			typeKey = "(?:tv|show|series)"
+		}
+		typeRE := regexp.MustCompile(`(?i)` + typeKey + `[/=:](\d+)`)
+		if matches := typeRE.FindStringSubmatch(value); len(matches) == 2 {
+			id, _ := strconv.Atoi(matches[1])
+			return id
+		}
+	}
+	return trailingInt(value)
+}
+
+func plexArtworkFromDiscoverMetadata(meta plexDiscoverMetadata, token string) plexArtwork {
+	artwork := plexArtwork{}
+
+	for _, image := range meta.Image {
+		imageURL := normalizePlexDiscoverAssetURL(image.URL, token)
+		if !isValidPlexArtworkURL(imageURL) || isPlexTrailerThumbnailURL(imageURL) {
+			continue
+		}
+		imageType := strings.ToLower(strings.TrimSpace(image.Type))
+		switch imageType {
+		case "coverart", "cover_art", "landscape", "wide", "tile":
+			artwork.CoverArt = append(artwork.CoverArt, imageURL)
+			artwork.Landscape = append(artwork.Landscape, imageURL)
+		case "background", "backgroundlandscape", "art", "hero":
+			artwork.Background = append(artwork.Background, imageURL)
+		case "clearlogo", "clear_logo", "logo":
+			artwork.ClearLogo = append(artwork.ClearLogo, imageURL)
+		case "thumbnail", "thumb", "poster", "coverposter", "cover_poster":
+			artwork.Thumbnail = append(artwork.Thumbnail, imageURL)
+		default:
+			if strings.Contains(imageURL, "/extras/") {
+				artwork.CoverArt = append(artwork.CoverArt, imageURL)
+				artwork.Landscape = append(artwork.Landscape, imageURL)
+			}
+		}
+	}
+
+	if thumb := normalizePlexDiscoverAssetURL(meta.Thumb, token); isValidPlexArtworkURL(thumb) && !isPlexTrailerThumbnailURL(thumb) {
+		artwork.Thumbnail = append(artwork.Thumbnail, thumb)
+	}
+	if art := normalizePlexDiscoverAssetURL(meta.Art, token); isValidPlexArtworkURL(art) && !isPlexTrailerThumbnailURL(art) {
+		artwork.Background = append(artwork.Background, art)
+	}
+	if banner := normalizePlexDiscoverAssetURL(meta.Banner, token); isValidPlexArtworkURL(banner) && !isPlexTrailerThumbnailURL(banner) {
+		artwork.Background = append(artwork.Background, banner)
+	}
+
+	return dedupePlexArtwork(artwork)
+}
+
+func normalizePlexDiscoverAssetURL(rawPath string, token string) string {
+	rawPath = strings.TrimSpace(rawPath)
+	if rawPath == "" {
+		return ""
+	}
+	rawPath = strings.ReplaceAll(rawPath, `\u002F`, "/")
+	rawPath = strings.ReplaceAll(rawPath, `\/`, "/")
+	rawPath = html.UnescapeString(rawPath)
+	if parsed, err := url.Parse(rawPath); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+		return parsed.String()
+	}
+
+	if !strings.HasPrefix(rawPath, "/") {
+		rawPath = "/" + rawPath
+	}
+	components, err := url.Parse("https://discover.provider.plex.tv" + rawPath)
+	if err != nil {
+		return rawPath
+	}
+	if strings.TrimSpace(token) != "" {
+		values := components.Query()
+		if values.Get("X-Plex-Token") == "" {
+			values.Set("X-Plex-Token", strings.TrimSpace(token))
+			components.RawQuery = values.Encode()
+		}
+	}
+	return components.String()
+}
+
 func structuredPlexArtwork(rawHTML string) plexArtwork {
 	normalized := normalizePlexArtworkHTML(rawHTML)
 	artwork := plexArtwork{}
@@ -4714,7 +5538,7 @@ func structuredPlexImageURL(rawHTML, field string) string {
 		return ""
 	}
 	decoded := decodePlexArtworkURL(matches[1])
-	if isValidPlexArtworkURL(decoded) {
+	if isValidPlexArtworkURL(decoded) && !isPlexTrailerThumbnailURL(decoded) {
 		return decoded
 	}
 	return ""
@@ -4730,7 +5554,7 @@ func structuredPlexLandscapeTileURL(rawHTML string) string {
 		if strings.Contains(decoded, "provider-static.plex.tv/discover/logos/p/") {
 			continue
 		}
-		if isValidPlexArtworkURL(decoded) {
+		if isValidPlexArtworkURL(decoded) && !isPlexTrailerThumbnailURL(decoded) {
 			return decoded
 		}
 	}
@@ -4747,7 +5571,7 @@ func structuredPlexClearLogoURL(rawHTML string) string {
 		if strings.Contains(decoded, "provider-static.plex.tv/discover/logos/p/") {
 			continue
 		}
-		if isValidPlexArtworkURL(decoded) {
+		if isValidPlexArtworkURL(decoded) && !isPlexTrailerThumbnailURL(decoded) {
 			return decoded
 		}
 	}
@@ -4842,7 +5666,38 @@ func isValidPlexArtworkURL(value string) bool {
 		host == "provider-static.plex.tv" ||
 		strings.HasSuffix(host, ".provider-static.plex.tv") ||
 		host == "images.plex.tv" ||
-		strings.HasSuffix(host, ".images.plex.tv")
+		strings.HasSuffix(host, ".images.plex.tv") ||
+		host == "discover.provider.plex.tv" ||
+		strings.HasSuffix(host, ".discover.provider.plex.tv")
+}
+
+func isPlexTrailerThumbnailURL(value string) bool {
+	return isPlexTrailerThumbnailURLDepth(value, 0)
+}
+
+func isPlexTrailerThumbnailURLDepth(value string, depth int) bool {
+	if depth > 2 {
+		return false
+	}
+	parsed, err := url.Parse(strings.TrimSpace(html.UnescapeString(value)))
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "i.ytimg.com" ||
+		strings.HasSuffix(host, ".ytimg.com") ||
+		host == "img.youtube.com" ||
+		strings.HasSuffix(host, ".youtube.com") ||
+		host == "youtube.com" {
+		return true
+	}
+	for _, key := range []string{"url", "src"} {
+		nested := strings.TrimSpace(parsed.Query().Get(key))
+		if nested != "" && nested != value && isPlexTrailerThumbnailURLDepth(nested, depth+1) {
+			return true
+		}
+	}
+	return false
 }
 
 func dedupePlexArtwork(artwork plexArtwork) plexArtwork {
@@ -6095,6 +6950,27 @@ func uniqueNonEmptyStrings(values []string) []string {
 	return out
 }
 
+func normalizedSearchText(value string) string {
+	value = strings.ToLower(strings.TrimSpace(html.UnescapeString(value)))
+	if value == "" {
+		return ""
+	}
+	var builder strings.Builder
+	lastSpace := false
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			builder.WriteRune(r)
+			lastSpace = false
+			continue
+		}
+		if !lastSpace && builder.Len() > 0 {
+			builder.WriteByte(' ')
+			lastSpace = true
+		}
+	}
+	return strings.TrimSpace(builder.String())
+}
+
 func absoluteAddonURL(raw string, base string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -6625,9 +7501,22 @@ const indexHTML = `<!doctype html>
 
       <div id="watch" class="pane">
         <div class="panel">
-          <h2>Watch History Import</h2>
-          <p class="muted">Optional. Import watched state and resume progress into this Vortexo Add-on Server. The Apple TV app can read this normalized local state after app-side integration.</p>
+          <h2>Watch History & Artwork</h2>
+          <p class="muted">Optional. Import watched state and let this server use Plex Discover artwork for installed add-on media.</p>
           <div class="grid">
+            <div class="card">
+              <h3>Plex Discover Artwork</h3>
+              <p>Sign in with Plex so the hourly artwork cache can use the same enhanced 16:9 landscapes that Plex Home rows use.</p>
+              <label>Plex Token</label>
+              <input id="plexAccessToken" type="password" placeholder="Paste token or use PIN login">
+              <div class="actions">
+                <button onclick="startPlexLogin()">Plex PIN Login</button>
+                <button class="secondary" onclick="savePlexSettings()">Save Token</button>
+                <button class="ghost" onclick="clearPlexSettings()">Clear</button>
+              </div>
+              <div id="plexDeviceBox" class="message muted"></div>
+              <div id="plexStatus" class="message muted">Sign in to load Plex artwork status.</div>
+            </div>
             <div class="card">
               <h3>Trakt</h3>
               <p>Imports watched movies, watched episodes, paused playback progress, and Up Next entries from your Trakt account.</p>
@@ -6868,6 +7757,81 @@ async function loadWatchSettings() {
   watchStatus.innerHTML = "Watch items: <strong>" + escapeHtml(String(state.count || 0)) + "</strong>"
     + " · Trakt token: " + (trakt.has_access_token ? "<span class='ok'>saved</span>" : "<span class='muted'>missing</span>");
   watchStatus.className = "message muted";
+  await loadPlexSettings();
+}
+async function loadPlexSettings() {
+  if (!token) return;
+  const res = await fetch("/api/v1/bridge/plex/settings", {headers:{authorization:"Bearer " + token}});
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { plexStatus.textContent = data.message || "Unable to load Plex settings."; plexStatus.className = "message error"; return; }
+  const plex = data.plex || {};
+  const name = plex.username || plex.title || plex.email || "";
+  plexStatus.innerHTML = "Plex token: " + (plex.has_access_token ? "<span class='ok'>saved</span>" : "<span class='muted'>missing</span>")
+    + (name ? " · Account: <strong>" + escapeHtml(name) + "</strong>" : "");
+  plexStatus.className = "message muted";
+}
+async function savePlexSettings() {
+  if (!token) { plexStatus.textContent = "Sign in first."; plexStatus.className = "message error"; showStep("signin"); return; }
+  const accessToken = plexAccessToken.value.trim();
+  if (!accessToken) { plexStatus.textContent = "Paste a Plex token or use PIN login."; plexStatus.className = "message error"; return; }
+  plexStatus.textContent = "Saving Plex token...";
+  plexStatus.className = "message muted";
+  const res = await fetch("/api/v1/bridge/plex/settings", {method:"POST", headers:{"content-type":"application/json", authorization:"Bearer " + token}, body: JSON.stringify({access_token: accessToken})});
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { plexStatus.textContent = data.message || "Failed to save Plex token."; plexStatus.className = "message error"; return; }
+  plexAccessToken.value = "";
+  markDone("watch");
+  plexStatus.textContent = "Plex connected. Artwork cache will use Discover landscapes on the next refresh.";
+  plexStatus.className = "message ok";
+  await loadPlexSettings();
+}
+async function clearPlexSettings() {
+  if (!token) { plexStatus.textContent = "Sign in first."; plexStatus.className = "message error"; showStep("signin"); return; }
+  const res = await fetch("/api/v1/bridge/plex/settings", {method:"POST", headers:{"content-type":"application/json", authorization:"Bearer " + token}, body: JSON.stringify({clear_token: true})});
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { plexStatus.textContent = data.message || "Failed to clear Plex token."; plexStatus.className = "message error"; return; }
+  plexAccessToken.value = "";
+  plexDeviceBox.textContent = "";
+  plexDeviceBox.className = "message muted";
+  plexStatus.textContent = "Plex token cleared. Artwork will fall back to public pages and backdrop-plus-logo cards.";
+  plexStatus.className = "message ok";
+  await loadPlexSettings();
+}
+async function startPlexLogin() {
+  if (!token) { plexStatus.textContent = "Sign in first."; plexStatus.className = "message error"; showStep("signin"); return; }
+  plexDeviceBox.textContent = "Requesting Plex PIN...";
+  plexDeviceBox.className = "message muted";
+  const res = await fetch("/api/v1/bridge/plex/pin", {method:"POST", headers:{authorization:"Bearer " + token}});
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { plexDeviceBox.textContent = data.message || "Plex PIN login failed."; plexDeviceBox.className = "message error"; return; }
+  localStorage.setItem("vortexoPlexPinID", String(data.id || ""));
+  const link = data.authorization_url || "https://plex.tv/link";
+  plexDeviceBox.innerHTML = "Open <a href='" + escapeAttr(link) + "' target='_blank' rel='noreferrer'>Plex login</a> and enter code <code>" + escapeHtml(data.code || "") + "</code>. Then click Check Login.";
+  plexDeviceBox.className = "message ok";
+  if (!document.getElementById("checkPlexPinButton")) {
+    const btn = document.createElement("button");
+    btn.id = "checkPlexPinButton";
+    btn.className = "secondary";
+    btn.textContent = "Check Login";
+    btn.onclick = pollPlexLogin;
+    plexDeviceBox.appendChild(document.createElement("br"));
+    plexDeviceBox.appendChild(btn);
+  }
+}
+async function pollPlexLogin() {
+  const pinID = parseInt(localStorage.getItem("vortexoPlexPinID") || "0", 10);
+  if (!pinID) { plexDeviceBox.textContent = "No Plex PIN saved. Start Plex login again."; plexDeviceBox.className = "message error"; return; }
+  plexDeviceBox.textContent = "Checking Plex login...";
+  plexDeviceBox.className = "message muted";
+  const res = await fetch("/api/v1/bridge/plex/pin/token", {method:"POST", headers:{"content-type":"application/json", authorization:"Bearer " + token}, body: JSON.stringify({pin_id: pinID})});
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { plexDeviceBox.textContent = data.message || "Still waiting for Plex approval."; plexDeviceBox.className = "message error"; return; }
+  if (!data.authenticated) { plexDeviceBox.textContent = "Still waiting for Plex approval."; plexDeviceBox.className = "message muted"; return; }
+  localStorage.removeItem("vortexoPlexPinID");
+  plexDeviceBox.textContent = "Plex connected.";
+  plexDeviceBox.className = "message ok";
+  markDone("watch");
+  await loadPlexSettings();
 }
 async function saveWatchSettings() {
   if (!token) { watchStatus.textContent = "Sign in first."; watchStatus.className = "message error"; showStep("signin"); return; }

@@ -69,3 +69,31 @@ func TestCachedPlexArtworkAppliesShowLandscapeToEpisodeWatchState(t *testing.T) 
 		t.Fatalf("expected cached Plex logo, got %q", item.LogoPath)
 	}
 }
+
+func TestDiscoverMetadataArtworkKeepsTrailersOutOfLandscape(t *testing.T) {
+	metadata := plexDiscoverMetadata{
+		Title: "Ghosts",
+		Type:  "show",
+		Image: []plexDiscoverImage{
+			{Type: "coverArt", URL: "https://metadata-static.plex.tv/extras/iva/ghosts/landscape.jpg"},
+			{Type: "coverArt", URL: "https://i.ytimg.com/vi/trailer/hq720.jpg"},
+			{Type: "coverArt", URL: "https://images.plex.tv/photo?url=https%3A%2F%2Fi.ytimg.com%2Fvi%2Ftrailer%2Fhq720.jpg"},
+			{Type: "background", URL: "https://metadata-static.plex.tv/b/gracenote/ghosts-background.jpg"},
+			{Type: "clearLogo", URL: "/photo/:/transcode?url=https%3A%2F%2Fmetadata-static.plex.tv%2Fghosts-logo.png"},
+		},
+	}
+
+	artwork := plexArtworkFromDiscoverMetadata(metadata, "plex-token")
+	if len(artwork.Landscape) != 1 || artwork.Landscape[0] != "https://metadata-static.plex.tv/extras/iva/ghosts/landscape.jpg" {
+		t.Fatalf("expected only proper Discover landscape, got %#v", artwork.Landscape)
+	}
+	if len(artwork.CoverArt) != 1 || artwork.CoverArt[0] != artwork.Landscape[0] {
+		t.Fatalf("expected coverArt to mirror proper landscape, got %#v", artwork.CoverArt)
+	}
+	if len(artwork.Background) != 1 || artwork.Background[0] != "https://metadata-static.plex.tv/b/gracenote/ghosts-background.jpg" {
+		t.Fatalf("expected backdrop to stay background, got %#v", artwork.Background)
+	}
+	if len(artwork.ClearLogo) != 1 {
+		t.Fatalf("expected normalized Discover clearLogo, got %#v", artwork.ClearLogo)
+	}
+}
