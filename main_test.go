@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+	"time"
+)
 
 func TestStructuredPlexArtworkKeepsLandscapeTileSeparateFromBackground(t *testing.T) {
 	html := `
@@ -95,5 +99,115 @@ func TestDiscoverMetadataArtworkKeepsTrailersOutOfLandscape(t *testing.T) {
 	}
 	if len(artwork.ClearLogo) != 1 {
 		t.Fatalf("expected normalized Discover clearLogo, got %#v", artwork.ClearLogo)
+	}
+}
+
+func TestDiscoverMetadataArtworkUsesImageSetAndSnapshotAsLandscape(t *testing.T) {
+	metadata := plexDiscoverMetadata{
+		Title: "The Boroughs",
+		Type:  "show",
+		Image: []plexDiscoverImage{
+			{Type: "snapshot", URL: "https://metadata-static.plex.tv/snapshot.jpg"},
+		},
+		Images: plexDiscoverImageSet{
+			CoverArt:            "https://metadata-static.plex.tv/cover-art.jpg",
+			BackgroundLandscape: "https://metadata-static.plex.tv/background.jpg",
+			ClearLogo:           "/photo/:/transcode?url=https%3A%2F%2Fmetadata-static.plex.tv%2Flogo.png",
+			CoverPoster:         "https://metadata-static.plex.tv/poster.jpg",
+		},
+	}
+
+	artwork := plexArtworkFromDiscoverMetadata(metadata, "plex-token")
+	if len(artwork.Landscape) != 2 {
+		t.Fatalf("expected snapshot and images.coverArt as clean landscapes, got %#v", artwork.Landscape)
+	}
+	if artwork.Landscape[0] != "https://metadata-static.plex.tv/snapshot.jpg" ||
+		artwork.Landscape[1] != "https://metadata-static.plex.tv/cover-art.jpg" {
+		t.Fatalf("unexpected landscape order: %#v", artwork.Landscape)
+	}
+	if len(artwork.Background) != 1 || artwork.Background[0] != "https://metadata-static.plex.tv/background.jpg" {
+		t.Fatalf("expected backgroundLandscape as backdrop, got %#v", artwork.Background)
+	}
+	if len(artwork.ClearLogo) != 1 || len(artwork.Thumbnail) != 1 {
+		t.Fatalf("expected logo and poster images, got logo=%#v thumbnail=%#v", artwork.ClearLogo, artwork.Thumbnail)
+	}
+}
+
+func TestDiscoverImageSetDecodesNestedValues(t *testing.T) {
+	var metadata plexDiscoverMetadata
+	err := json.Unmarshal([]byte(`{
+		"title": "The Boroughs",
+		"images": {
+			"coverArt": {"image": {"url": "https://metadata-static.plex.tv/cover-art.jpg"}},
+			"snapshot": [{"url": "https://metadata-static.plex.tv/snapshot.jpg"}],
+			"clearLogo": "https://metadata-static.plex.tv/logo.png"
+		}
+	}`), &metadata)
+	if err != nil {
+		t.Fatalf("expected nested image object to decode, got %v", err)
+	}
+	if metadata.Images.CoverArt != "https://metadata-static.plex.tv/cover-art.jpg" {
+		t.Fatalf("expected nested coverArt URL, got %q", metadata.Images.CoverArt)
+	}
+	if metadata.Images.Snapshot != "https://metadata-static.plex.tv/snapshot.jpg" {
+		t.Fatalf("expected array snapshot URL, got %q", metadata.Images.Snapshot)
+	}
+	if metadata.Images.ClearLogo != "https://metadata-static.plex.tv/logo.png" {
+		t.Fatalf("expected string clearLogo URL, got %q", metadata.Images.ClearLogo)
+	}
+}
+
+func TestBestPlexDiscoverSearchMatchAllowsExactTitleWhenIDsAreMissing(t *testing.T) {
+	results := []plexDiscoverMetadata{
+		{
+			Type:  "show",
+			Title: "The Boroughs",
+			Year:  2026,
+			GUID:  "plex://show/abc123",
+		},
+	}
+	item := plexArtworkSeedItem{
+		MediaType: "tv",
+		TMDBID:    224941,
+		Title:     "The Boroughs",
+		Year:      2026,
+	}
+
+	match := bestPlexDiscoverSearchMatch(results, item)
+	if match == nil || match.Title != "The Boroughs" {
+		t.Fatalf("expected exact title/year match without external IDs, got %#v", match)
+	}
+}
+
+func TestPlexArtworkSeedNeedsRefreshRepairsBackdropOnlyWithToken(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	state := &appState{
+		config: bridgeConfig{
+			Plex: plexAuthConfig{
+				AccessToken:    "token",
+				LastSignedInAt: now.Add(-2 * time.Hour),
+			},
+		},
+		plexArtwork: map[string]plexArtworkCacheRecord{},
+	}
+	record := plexArtworkCacheRecord{
+		plexArtworkEntry: plexArtworkEntry{
+			Version:    1,
+			MediaType:  "tv",
+			TMDBID:     91371,
+			Title:      "The UnXplained",
+			SourcePage: "https://watch.plex.tv/en-GB/show/the-unxplained",
+			Artwork: plexArtwork{
+				Background: []string{"https://metadata-static.plex.tv/background.jpg"},
+			},
+		},
+		Status:    "ok",
+		FetchedAt: now.Add(-2 * plexArtworkIncompleteRetryAfter),
+	}
+	state.plexArtwork[plexArtworkKey(record.MediaType, record.TMDBID, record.IMDBID, record.Title, record.Year)] = record
+
+	seed := plexArtworkSeedItem{MediaType: "tv", TMDBID: 91371, Title: "The UnXplained"}
+	if !state.plexArtworkSeedNeedsRefresh(seed, now.Add(-plexArtworkStaleAfter), false, now) {
+		t.Fatalf("expected stale backdrop-only public artwork to be rechecked with Plex token")
 	}
 }

@@ -607,14 +607,14 @@ function App() {
 
   async function refreshArtwork() {
     setBusy(true);
-    setPlexStatus("Starting artwork refresh...");
+    setPlexStatus("Starting forced artwork repair...");
     try {
       const data = await request("/api/v1/artwork/refresh", {
         method: "POST",
-        body: JSON.stringify({ limit: 2000 }),
+        body: JSON.stringify({ limit: 2000, force: true }),
       });
       setMessage(data.message || "Artwork refresh started");
-      setPlexStatus(`${data.message || "Artwork refresh started"}. Give it a minute, then refresh Vortexo Home.`);
+      setPlexStatus(`${data.message || "Artwork refresh started"}. Rechecking missing and backdrop-only Plex art.`);
     } catch (error) {
       setMessage(error.message);
       setPlexStatus(error.message);

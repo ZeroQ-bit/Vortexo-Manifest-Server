@@ -43,6 +43,7 @@ const (
 	plexArtworkInitialDelay         = 15 * time.Second
 	plexArtworkFetchDelay           = 2 * time.Second
 	plexArtworkStaleAfter           = 30 * 24 * time.Hour
+	plexArtworkIncompleteRetryAfter = time.Hour
 	plexArtworkSyncLimit            = 500
 	plexArtworkSeedCatalogLimit     = 60
 )
@@ -644,27 +645,98 @@ type plexDiscoverImage struct {
 	URL  string `json:"url,omitempty"`
 }
 
+type plexDiscoverImageSet struct {
+	CoverArt            string `json:"coverArt,omitempty"`
+	Landscape           string `json:"landscape,omitempty"`
+	Wide                string `json:"wide,omitempty"`
+	Tile                string `json:"tile,omitempty"`
+	Snapshot            string `json:"snapshot,omitempty"`
+	Background          string `json:"background,omitempty"`
+	BackgroundLandscape string `json:"backgroundLandscape,omitempty"`
+	Art                 string `json:"art,omitempty"`
+	Hero                string `json:"hero,omitempty"`
+	ClearLogo           string `json:"clearLogo,omitempty"`
+	Logo                string `json:"logo,omitempty"`
+	Thumbnail           string `json:"thumbnail,omitempty"`
+	Thumb               string `json:"thumb,omitempty"`
+	Poster              string `json:"poster,omitempty"`
+	CoverPoster         string `json:"coverPoster,omitempty"`
+}
+
+func (s *plexDiscoverImageSet) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil
+	}
+
+	s.CoverArt = firstNonEmpty(s.CoverArt, plexDiscoverImageURLFromRaw(raw["coverArt"]))
+	s.Landscape = firstNonEmpty(s.Landscape, plexDiscoverImageURLFromRaw(raw["landscape"]))
+	s.Wide = firstNonEmpty(s.Wide, plexDiscoverImageURLFromRaw(raw["wide"]))
+	s.Tile = firstNonEmpty(s.Tile, plexDiscoverImageURLFromRaw(raw["tile"]))
+	s.Snapshot = firstNonEmpty(s.Snapshot, plexDiscoverImageURLFromRaw(raw["snapshot"]))
+	s.Background = firstNonEmpty(s.Background, plexDiscoverImageURLFromRaw(raw["background"]))
+	s.BackgroundLandscape = firstNonEmpty(s.BackgroundLandscape, plexDiscoverImageURLFromRaw(raw["backgroundLandscape"]))
+	s.Art = firstNonEmpty(s.Art, plexDiscoverImageURLFromRaw(raw["art"]))
+	s.Hero = firstNonEmpty(s.Hero, plexDiscoverImageURLFromRaw(raw["hero"]))
+	s.ClearLogo = firstNonEmpty(s.ClearLogo, plexDiscoverImageURLFromRaw(raw["clearLogo"]))
+	s.Logo = firstNonEmpty(s.Logo, plexDiscoverImageURLFromRaw(raw["logo"]))
+	s.Thumbnail = firstNonEmpty(s.Thumbnail, plexDiscoverImageURLFromRaw(raw["thumbnail"]))
+	s.Thumb = firstNonEmpty(s.Thumb, plexDiscoverImageURLFromRaw(raw["thumb"]))
+	s.Poster = firstNonEmpty(s.Poster, plexDiscoverImageURLFromRaw(raw["poster"]))
+	s.CoverPoster = firstNonEmpty(s.CoverPoster, plexDiscoverImageURLFromRaw(raw["coverPoster"]))
+	return nil
+}
+
+func plexDiscoverImageURLFromRaw(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err == nil {
+		return strings.TrimSpace(value)
+	}
+	var values []json.RawMessage
+	if err := json.Unmarshal(raw, &values); err == nil {
+		for _, item := range values {
+			if decoded := plexDiscoverImageURLFromRaw(item); decoded != "" {
+				return decoded
+			}
+		}
+		return ""
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err == nil {
+		for _, key := range []string{"url", "src", "image"} {
+			if decoded := plexDiscoverImageURLFromRaw(object[key]); decoded != "" {
+				return decoded
+			}
+		}
+	}
+	return ""
+}
+
 type plexDiscoverGuid struct {
 	ID string `json:"id,omitempty"`
 }
 
 type plexDiscoverMetadata struct {
-	RatingKey             string              `json:"ratingKey,omitempty"`
-	Key                   string              `json:"key,omitempty"`
-	GUID                  string              `json:"guid,omitempty"`
-	PrimaryGUID           string              `json:"primaryGuid,omitempty"`
-	Type                  string              `json:"type,omitempty"`
-	Title                 string              `json:"title,omitempty"`
-	OriginalTitle         string              `json:"originalTitle,omitempty"`
-	Year                  int                 `json:"year,omitempty"`
-	OriginallyAvailableAt string              `json:"originallyAvailableAt,omitempty"`
-	PublicPagesURL        string              `json:"publicPagesURL,omitempty"`
-	Slug                  string              `json:"slug,omitempty"`
-	Thumb                 string              `json:"thumb,omitempty"`
-	Art                   string              `json:"art,omitempty"`
-	Banner                string              `json:"banner,omitempty"`
-	Image                 []plexDiscoverImage `json:"Image,omitempty"`
-	Guid                  []plexDiscoverGuid  `json:"Guid,omitempty"`
+	RatingKey             string               `json:"ratingKey,omitempty"`
+	Key                   string               `json:"key,omitempty"`
+	GUID                  string               `json:"guid,omitempty"`
+	PrimaryGUID           string               `json:"primaryGuid,omitempty"`
+	Type                  string               `json:"type,omitempty"`
+	Title                 string               `json:"title,omitempty"`
+	OriginalTitle         string               `json:"originalTitle,omitempty"`
+	Year                  int                  `json:"year,omitempty"`
+	OriginallyAvailableAt string               `json:"originallyAvailableAt,omitempty"`
+	PublicPagesURL        string               `json:"publicPagesURL,omitempty"`
+	Slug                  string               `json:"slug,omitempty"`
+	Thumb                 string               `json:"thumb,omitempty"`
+	Art                   string               `json:"art,omitempty"`
+	Banner                string               `json:"banner,omitempty"`
+	Image                 []plexDiscoverImage  `json:"Image,omitempty"`
+	Images                plexDiscoverImageSet `json:"images,omitempty"`
+	Guid                  []plexDiscoverGuid   `json:"Guid,omitempty"`
 }
 
 type plexDiscoverSearchResponse struct {
@@ -1134,8 +1206,7 @@ func (s *appState) plexArtworkDashboardStats() plexArtworkDashboardStats {
 		switch strings.ToLower(strings.TrimSpace(record.Status)) {
 		case "ok":
 			stats.OK++
-			hasCleanLandscape := len(record.Artwork.Landscape) > 0 || len(record.Artwork.CoverArt) > 0
-			if hasCleanLandscape {
+			if plexArtworkHasCleanLandscape(record.Artwork) {
 				stats.CleanLandscape++
 			} else if len(record.Artwork.Background) > 0 {
 				stats.BackdropOnly++
@@ -2374,12 +2445,14 @@ func (s *appState) handlePlexArtworkRefresh(w http.ResponseWriter, r *http.Reque
 	}
 	limit := plexArtworkSyncLimit
 	var req struct {
-		Limit int `json:"limit"`
+		Limit int  `json:"limit"`
+		Force bool `json:"force"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	if req.Limit > 0 {
 		limit = minInt(req.Limit, 2000)
 	}
+	forceRepair := req.Force
 
 	if !s.plexArtworkSyncMu.TryLock() {
 		respondError(w, http.StatusConflict, "plex artwork sync is already running")
@@ -2392,18 +2465,19 @@ func (s *appState) handlePlexArtworkRefresh(w http.ResponseWriter, r *http.Reque
 			s.setPlexArtworkSyncRunning(false)
 			s.plexArtworkSyncMu.Unlock()
 		}()
-		stats, err := s.syncPlexArtworkCache(context.Background(), limit)
+		stats, err := s.syncPlexArtworkCache(context.Background(), limit, forceRepair)
 		s.rememberPlexArtworkSyncStats(stats)
 		if err != nil {
 			log.Printf("[PlexArtwork] manual sync error: %v", err)
 			return
 		}
-		log.Printf("[PlexArtwork] manual sync complete ok=%d miss=%d failed=%d stopped=%q", stats.OK, stats.Miss, stats.Failed, stats.Stopped)
+		log.Printf("[PlexArtwork] manual sync complete forceRepair=%t ok=%d miss=%d failed=%d stopped=%q", forceRepair, stats.OK, stats.Miss, stats.Failed, stats.Stopped)
 	}()
 
 	respondJSON(w, http.StatusAccepted, map[string]any{
 		"message": "Plex artwork sync triggered",
 		"limit":   limit,
+		"force":   forceRepair,
 	})
 }
 
@@ -4700,7 +4774,7 @@ func (s *appState) runPlexArtworkSyncWorker(ctx context.Context) {
 
 		if s.plexArtworkSyncMu.TryLock() {
 			s.setPlexArtworkSyncRunning(true)
-			stats, err := s.syncPlexArtworkCache(ctx, plexArtworkSyncLimit)
+			stats, err := s.syncPlexArtworkCache(ctx, plexArtworkSyncLimit, false)
 			s.rememberPlexArtworkSyncStats(stats)
 			s.setPlexArtworkSyncRunning(false)
 			s.plexArtworkSyncMu.Unlock()
@@ -4717,7 +4791,7 @@ func (s *appState) runPlexArtworkSyncWorker(ctx context.Context) {
 	}
 }
 
-func (s *appState) syncPlexArtworkCache(ctx context.Context, limit int) (*plexArtworkSyncStats, error) {
+func (s *appState) syncPlexArtworkCache(ctx context.Context, limit int, forceRepair bool) (*plexArtworkSyncStats, error) {
 	if limit <= 0 {
 		limit = plexArtworkSyncLimit
 	}
@@ -4728,9 +4802,9 @@ func (s *appState) syncPlexArtworkCache(ctx context.Context, limit int) (*plexAr
 	}
 
 	staleBefore := time.Now().Add(-plexArtworkStaleAfter)
-	items := s.collectPlexArtworkSeedItems(ctx, limit, staleBefore)
+	items := s.collectPlexArtworkSeedItems(ctx, limit, staleBefore, forceRepair)
 	stats.Attempted = len(items)
-	log.Printf("[PlexArtwork] starting sync selected=%d limit=%d delay=%s staleAfter=%s", len(items), limit, plexArtworkFetchDelay, plexArtworkStaleAfter)
+	log.Printf("[PlexArtwork] starting sync selected=%d limit=%d delay=%s staleAfter=%s forceRepair=%t", len(items), limit, plexArtworkFetchDelay, plexArtworkStaleAfter, forceRepair)
 
 	for index, item := range items {
 		if err := ctx.Err(); err != nil {
@@ -4813,11 +4887,12 @@ func (s *appState) syncPlexArtworkCache(ctx context.Context, limit int) (*plexAr
 	return stats, nil
 }
 
-func (s *appState) collectPlexArtworkSeedItems(ctx context.Context, limit int, staleBefore time.Time) []plexArtworkSeedItem {
+func (s *appState) collectPlexArtworkSeedItems(ctx context.Context, limit int, staleBefore time.Time, forceRepair bool) []plexArtworkSeedItem {
 	if limit <= 0 {
 		limit = plexArtworkSyncLimit
 	}
 
+	now := time.Now()
 	seen := map[string]bool{}
 	items := make([]plexArtworkSeedItem, 0, limit)
 	add := func(seed plexArtworkSeedItem) {
@@ -4831,7 +4906,7 @@ func (s *appState) collectPlexArtworkSeedItems(ctx context.Context, limit int, s
 			return
 		}
 		key := plexArtworkKey(seed.MediaType, seed.TMDBID, seed.IMDBID, seed.Title, seed.Year)
-		if key == "" || seen[key] || !s.plexArtworkSeedNeedsRefresh(seed, staleBefore) {
+		if key == "" || seen[key] || !s.plexArtworkSeedNeedsRefresh(seed, staleBefore, forceRepair, now) {
 			return
 		}
 		seen[key] = true
@@ -4880,15 +4955,36 @@ func (s *appState) collectPlexArtworkSeedItems(ctx context.Context, limit int, s
 	return items
 }
 
-func (s *appState) plexArtworkSeedNeedsRefresh(seed plexArtworkSeedItem, staleBefore time.Time) bool {
+func (s *appState) plexArtworkSeedNeedsRefresh(seed plexArtworkSeedItem, staleBefore time.Time, forceRepair bool, now time.Time) bool {
 	record, ok := s.getCachedPlexArtwork(seed.MediaType, seed.TMDBID, seed.IMDBID, seed.Title, seed.Year)
 	if !ok {
 		return true
 	}
 	if record.Status != "ok" {
-		return record.FetchedAt.Before(time.Now().Add(-24 * time.Hour))
+		return forceRepair || record.FetchedAt.IsZero() || record.FetchedAt.Before(now.Add(-24*time.Hour))
+	}
+	if forceRepair && !plexArtworkHasCleanLandscape(record.Artwork) {
+		return true
+	}
+	if s.plexAccountToken() != "" &&
+		!plexArtworkHasCleanLandscape(record.Artwork) &&
+		!isSignedPlexArtworkSource(record.SourcePage) {
+		if signedInAt := s.plexLastSignedInAt(); !signedInAt.IsZero() && record.FetchedAt.Before(signedInAt) {
+			return true
+		}
+		return record.FetchedAt.IsZero() || record.FetchedAt.Before(now.Add(-plexArtworkIncompleteRetryAfter))
 	}
 	return record.FetchedAt.IsZero() || record.FetchedAt.Before(staleBefore)
+}
+
+func (s *appState) plexLastSignedInAt() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.config.Plex.LastSignedInAt
+}
+
+func plexArtworkHasCleanLandscape(artwork plexArtwork) bool {
+	return len(artwork.Landscape) > 0 || len(artwork.CoverArt) > 0
 }
 
 func (s *appState) findPlexArtworkSeedItem(ctx context.Context, mediaType string, tmdbID int) plexArtworkSeedItem {
@@ -5401,6 +5497,8 @@ func bestPlexDiscoverSearchMatch(results []plexDiscoverMetadata, item plexArtwor
 		exactTitle := preferredTitle != "" && candidateTitle != "" && candidateTitle == preferredTitle
 		partialTitle := preferredTitle != "" && candidateTitle != "" &&
 			(strings.Contains(candidateTitle, preferredTitle) || strings.Contains(preferredTitle, candidateTitle))
+		candidateYear := firstNonZero(candidate.Year, yearFromText(candidate.OriginallyAvailableAt))
+		yearMatches := item.Year == 0 || candidateYear == 0 || candidateYear == item.Year
 
 		score := 0
 		if item.TMDBID > 0 && candidateTMDB == item.TMDBID {
@@ -5420,9 +5518,16 @@ func bestPlexDiscoverSearchMatch(results []plexDiscoverMetadata, item plexArtwor
 			score += 50
 		}
 
+		if item.TMDBID > 0 && candidateTMDB > 0 && candidateTMDB != item.TMDBID {
+			continue
+		}
+		if preferredIMDB != "" && candidateIMDB != "" && !strings.EqualFold(candidateIMDB, preferredIMDB) {
+			continue
+		}
 		if item.TMDBID > 0 || preferredIMDB != "" {
-			if item.TMDBID > 0 && candidateTMDB != item.TMDBID &&
-				(preferredIMDB == "" || !strings.EqualFold(candidateIMDB, preferredIMDB)) {
+			hasExternalMatch := (item.TMDBID > 0 && candidateTMDB == item.TMDBID) ||
+				(preferredIMDB != "" && strings.EqualFold(candidateIMDB, preferredIMDB))
+			if !hasExternalMatch && !(exactTitle && yearMatches) && !(partialTitle && item.Year > 0 && candidateYear == item.Year) {
 				continue
 			}
 		}
@@ -5558,17 +5663,16 @@ func tmdbIDFromDiscoverValue(value string, preferredType string) int {
 func plexArtworkFromDiscoverMetadata(meta plexDiscoverMetadata, token string) plexArtwork {
 	artwork := plexArtwork{}
 
-	for _, image := range meta.Image {
-		imageURL := normalizePlexDiscoverAssetURL(image.URL, token)
+	addImage := func(imageType string, rawURL string) {
+		imageURL := normalizePlexDiscoverAssetURL(rawURL, token)
 		if !isValidPlexArtworkURL(imageURL) || isPlexTrailerThumbnailURL(imageURL) {
-			continue
+			return
 		}
-		imageType := strings.ToLower(strings.TrimSpace(image.Type))
-		switch imageType {
-		case "coverart", "cover_art", "landscape", "wide", "tile":
+		switch normalizedPlexDiscoverImageType(imageType) {
+		case "coverart", "cover_art", "landscape", "wide", "tile", "snapshot":
 			artwork.CoverArt = append(artwork.CoverArt, imageURL)
 			artwork.Landscape = append(artwork.Landscape, imageURL)
-		case "background", "backgroundlandscape", "art", "hero":
+		case "background", "backgroundlandscape", "background_landscape", "art", "hero":
 			artwork.Background = append(artwork.Background, imageURL)
 		case "clearlogo", "clear_logo", "logo":
 			artwork.ClearLogo = append(artwork.ClearLogo, imageURL)
@@ -5582,17 +5686,34 @@ func plexArtworkFromDiscoverMetadata(meta plexDiscoverMetadata, token string) pl
 		}
 	}
 
-	if thumb := normalizePlexDiscoverAssetURL(meta.Thumb, token); isValidPlexArtworkURL(thumb) && !isPlexTrailerThumbnailURL(thumb) {
-		artwork.Thumbnail = append(artwork.Thumbnail, thumb)
-	}
-	if art := normalizePlexDiscoverAssetURL(meta.Art, token); isValidPlexArtworkURL(art) && !isPlexTrailerThumbnailURL(art) {
-		artwork.Background = append(artwork.Background, art)
-	}
-	if banner := normalizePlexDiscoverAssetURL(meta.Banner, token); isValidPlexArtworkURL(banner) && !isPlexTrailerThumbnailURL(banner) {
-		artwork.Background = append(artwork.Background, banner)
+	for _, image := range meta.Image {
+		addImage(image.Type, image.URL)
 	}
 
+	addImage("coverArt", meta.Images.CoverArt)
+	addImage("landscape", meta.Images.Landscape)
+	addImage("wide", meta.Images.Wide)
+	addImage("tile", meta.Images.Tile)
+	addImage("snapshot", meta.Images.Snapshot)
+	addImage("background", meta.Images.Background)
+	addImage("backgroundLandscape", meta.Images.BackgroundLandscape)
+	addImage("art", meta.Images.Art)
+	addImage("hero", meta.Images.Hero)
+	addImage("clearLogo", meta.Images.ClearLogo)
+	addImage("logo", meta.Images.Logo)
+	addImage("thumbnail", meta.Images.Thumbnail)
+	addImage("thumb", meta.Images.Thumb)
+	addImage("poster", meta.Images.Poster)
+	addImage("coverPoster", meta.Images.CoverPoster)
+	addImage("thumb", meta.Thumb)
+	addImage("art", meta.Art)
+	addImage("background", meta.Banner)
+
 	return dedupePlexArtwork(artwork)
+}
+
+func normalizedPlexDiscoverImageType(value string) string {
+	return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(value)), "-", "_")
 }
 
 func normalizePlexDiscoverAssetURL(rawPath string, token string) string {
