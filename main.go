@@ -34,18 +34,29 @@ const (
 	watchStateEnrichmentConcurrency = 6
 	watchStateMetadataTimeout       = 6 * time.Second
 	watchStateMetadataCacheTTL      = 30 * time.Minute
+	plexArtworkSyncInterval         = time.Hour
+	plexArtworkInitialDelay         = 15 * time.Second
+	plexArtworkFetchDelay           = 2 * time.Second
+	plexArtworkStaleAfter           = 30 * 24 * time.Hour
+	plexArtworkSyncLimit            = 500
+	plexArtworkSeedCatalogLimit     = 60
 )
 
 var srtTimestampPattern = regexp.MustCompile(`(\d{2}:\d{2}:\d{2}),(\d{3})`)
 
 type appState struct {
-	mu         sync.RWMutex
-	dataDir    string
-	config     bridgeConfig
-	watchState watchStateStore
-	client     *http.Client
-	manifest   map[string]manifestCacheEntry
-	watchMeta  map[string]watchStateMetadataCacheEntry
+	mu                       sync.RWMutex
+	dataDir                  string
+	config                   bridgeConfig
+	watchState               watchStateStore
+	client                   *http.Client
+	manifest                 map[string]manifestCacheEntry
+	watchMeta                map[string]watchStateMetadataCacheEntry
+	plexArtworkMu            sync.RWMutex
+	plexArtwork              map[string]plexArtworkCacheRecord
+	plexArtworkSyncMu        sync.Mutex
+	plexArtworkRequestMu     sync.Mutex
+	plexArtworkLastRequestAt time.Time
 }
 
 type bridgeConfig struct {
@@ -563,6 +574,66 @@ type watchStateItem struct {
 	UpdatedAt       time.Time `json:"updated_at"`
 }
 
+type plexArtwork struct {
+	CoverArt   []string `json:"coverArt"`
+	Landscape  []string `json:"landscape"`
+	Background []string `json:"background"`
+	ClearLogo  []string `json:"clearLogo"`
+	Thumbnail  []string `json:"thumbnail"`
+}
+
+type plexArtworkEntry struct {
+	Version    int         `json:"version"`
+	MediaType  string      `json:"mediaType"`
+	TMDBID     int         `json:"tmdbId"`
+	IMDBID     string      `json:"imdbId,omitempty"`
+	Title      string      `json:"title,omitempty"`
+	Year       int         `json:"year,omitempty"`
+	SourcePage string      `json:"sourcePage,omitempty"`
+	UpdatedAt  time.Time   `json:"updatedAt"`
+	Artwork    plexArtwork `json:"artwork"`
+}
+
+type plexArtworkCacheRecord struct {
+	plexArtworkEntry
+	Status    string    `json:"status"`
+	Error     string    `json:"error,omitempty"`
+	FetchedAt time.Time `json:"fetchedAt"`
+}
+
+type plexArtworkCacheFile struct {
+	UpdatedAt time.Time                `json:"updatedAt"`
+	Items     []plexArtworkCacheRecord `json:"items"`
+}
+
+type plexArtworkSeedItem struct {
+	MediaType string
+	TMDBID    int
+	IMDBID    string
+	Title     string
+	Year      int
+}
+
+type plexArtworkSyncStats struct {
+	Limit       int       `json:"limit"`
+	Attempted   int       `json:"attempted"`
+	OK          int       `json:"ok"`
+	Miss        int       `json:"miss"`
+	Skipped     int       `json:"skipped"`
+	Failed      int       `json:"failed"`
+	Stopped     string    `json:"stopped,omitempty"`
+	StartedAt   time.Time `json:"startedAt"`
+	CompletedAt time.Time `json:"completedAt"`
+}
+
+func (a plexArtwork) isEmpty() bool {
+	return len(a.CoverArt) == 0 &&
+		len(a.Landscape) == 0 &&
+		len(a.Background) == 0 &&
+		len(a.ClearLogo) == 0 &&
+		len(a.Thumbnail) == 0
+}
+
 type watchSettingsRequest struct {
 	TraktClientID     string `json:"trakt_client_id"`
 	TraktClientSecret string `json:"trakt_client_secret"`
@@ -688,10 +759,11 @@ func run() error {
 	}
 
 	state := &appState{
-		dataDir:   dataDir,
-		client:    &http.Client{Timeout: 20 * time.Second},
-		manifest:  map[string]manifestCacheEntry{},
-		watchMeta: map[string]watchStateMetadataCacheEntry{},
+		dataDir:     dataDir,
+		client:      &http.Client{Timeout: 20 * time.Second},
+		manifest:    map[string]manifestCacheEntry{},
+		watchMeta:   map[string]watchStateMetadataCacheEntry{},
+		plexArtwork: map[string]plexArtworkCacheRecord{},
 	}
 	if err := state.load(); err != nil {
 		return err
@@ -699,9 +771,13 @@ func run() error {
 	if err := state.loadWatchState(); err != nil {
 		return err
 	}
+	if err := state.loadPlexArtworkCache(); err != nil {
+		return err
+	}
 
 	mux := http.NewServeMux()
 	state.registerRoutes(mux)
+	go state.runPlexArtworkSyncWorker(context.Background())
 
 	addr := firstNonEmpty(os.Getenv("VORTEXO_LISTEN_ADDR"), os.Getenv("PORT"), defaultListenAddr)
 	if !strings.HasPrefix(addr, ":") && !strings.Contains(addr, ":") {
@@ -738,6 +814,8 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/channels/", s.handleChannels)
 	mux.HandleFunc("/api/v1/discover/trending", s.handleDiscoverList)
 	mux.HandleFunc("/api/v1/discover/popular", s.handleDiscoverList)
+	mux.HandleFunc("/api/v1/artwork/refresh", s.requireAuth(s.handlePlexArtworkRefresh))
+	mux.HandleFunc("/api/v1/artwork/", s.handlePlexArtworkByID)
 	mux.HandleFunc("/api/v1/vortexo/capabilities", s.handleCapabilities)
 	mux.HandleFunc("/api/v1/vortexo/home", s.handleVortexoHome)
 	mux.HandleFunc("/api/v1/vortexo/live-tv/rows", s.handleVortexoLiveTVRows)
@@ -857,6 +935,60 @@ func (s *appState) saveWatchStateLocked() error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(s.dataDir, "watch_state.json"), data, 0o600)
+}
+
+func (s *appState) loadPlexArtworkCache() error {
+	path := filepath.Join(s.dataDir, "plex_artwork_cache.json")
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		s.plexArtworkMu.Lock()
+		s.plexArtwork = map[string]plexArtworkCacheRecord{}
+		s.plexArtworkMu.Unlock()
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	var file plexArtworkCacheFile
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &file); err != nil {
+			return err
+		}
+	}
+
+	records := map[string]plexArtworkCacheRecord{}
+	for _, record := range file.Items {
+		key := plexArtworkKey(record.MediaType, record.TMDBID, record.IMDBID, record.Title, record.Year)
+		if key == "" {
+			continue
+		}
+		record.MediaType = normalizePlexArtworkMediaType(record.MediaType)
+		record.Artwork = dedupePlexArtwork(record.Artwork)
+		records[key] = record
+	}
+
+	s.plexArtworkMu.Lock()
+	s.plexArtwork = records
+	s.plexArtworkMu.Unlock()
+	return nil
+}
+
+func (s *appState) savePlexArtworkCacheSnapshot(records []plexArtworkCacheRecord) error {
+	sort.SliceStable(records, func(i, j int) bool {
+		left := plexArtworkKey(records[i].MediaType, records[i].TMDBID, records[i].IMDBID, records[i].Title, records[i].Year)
+		right := plexArtworkKey(records[j].MediaType, records[j].TMDBID, records[j].IMDBID, records[j].Title, records[j].Year)
+		return left < right
+	})
+	file := plexArtworkCacheFile{
+		UpdatedAt: time.Now().UTC(),
+		Items:     records,
+	}
+	data, err := json.MarshalIndent(file, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(s.dataDir, "plex_artwork_cache.json"), data, 0o600)
 }
 
 func (s *appState) withCORS(next http.Handler) http.Handler {
@@ -1124,6 +1256,9 @@ func (s *appState) handleVortexoWatchState(w http.ResponseWriter, r *http.Reques
 	}
 	s.mu.RUnlock()
 	state.Items = s.enrichWatchStateWithManifestMetadata(r.Context(), state.Items)
+	for i := range state.Items {
+		s.applyCachedPlexArtworkToWatchStateItem(&state.Items[i])
+	}
 	respondJSON(w, http.StatusOK, state)
 }
 
@@ -1887,6 +2022,86 @@ func (s *appState) handleDiscoverList(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]any{"items": []any{}})
 }
 
+func (s *appState) handlePlexArtworkRefresh(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	limit := plexArtworkSyncLimit
+	var req struct {
+		Limit int `json:"limit"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.Limit > 0 {
+		limit = minInt(req.Limit, 2000)
+	}
+
+	if !s.plexArtworkSyncMu.TryLock() {
+		respondError(w, http.StatusConflict, "plex artwork sync is already running")
+		return
+	}
+
+	go func() {
+		defer s.plexArtworkSyncMu.Unlock()
+		stats, err := s.syncPlexArtworkCache(context.Background(), limit)
+		if err != nil {
+			log.Printf("[PlexArtwork] manual sync error: %v", err)
+			return
+		}
+		log.Printf("[PlexArtwork] manual sync complete ok=%d miss=%d failed=%d stopped=%q", stats.OK, stats.Miss, stats.Failed, stats.Stopped)
+	}()
+
+	respondJSON(w, http.StatusAccepted, map[string]any{
+		"message": "Plex artwork sync triggered",
+		"limit":   limit,
+	})
+}
+
+func (s *appState) handlePlexArtworkByID(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	raw := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/artwork/"), "/")
+	parts := strings.Split(raw, "/")
+	if len(parts) != 2 {
+		respondError(w, http.StatusNotFound, "plex artwork not found")
+		return
+	}
+	mediaType := normalizePlexArtworkMediaType(parts[0])
+	tmdbID, err := strconv.Atoi(strings.TrimSuffix(parts[1], ".json"))
+	if err != nil || tmdbID <= 0 || mediaType == "" {
+		respondError(w, http.StatusBadRequest, "invalid artwork id")
+		return
+	}
+
+	if r.URL.Query().Get("refresh") == "true" {
+		item := s.findPlexArtworkSeedItem(r.Context(), mediaType, tmdbID)
+		if item.TMDBID <= 0 {
+			item = plexArtworkSeedItem{MediaType: mediaType, TMDBID: tmdbID}
+		}
+		record, err := s.refreshPlexArtworkSeed(r.Context(), item)
+		if err != nil {
+			respondError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		if record == nil || record.Status != "ok" || record.Artwork.isEmpty() {
+			respondError(w, http.StatusNotFound, "plex artwork unavailable")
+			return
+		}
+		respondJSON(w, http.StatusOK, record)
+		return
+	}
+
+	record, ok := s.getCachedPlexArtwork(mediaType, tmdbID, "", "", 0)
+	if !ok || record.Status != "ok" || record.Artwork.isEmpty() {
+		respondError(w, http.StatusNotFound, "plex artwork not cached")
+		return
+	}
+	respondJSON(w, http.StatusOK, record)
+}
+
 func (s *appState) handleEmptyList(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -2027,6 +2242,7 @@ func (s *appState) handleVortexoHome(w http.ResponseWriter, r *http.Request) {
 		rowItems := make([]vortexoHomeItem, 0, itemLimit)
 		for _, meta := range items {
 			homeItem := homeItemFromStremio(meta, mediaType)
+			s.applyCachedPlexArtworkToHomeItem(&homeItem)
 			key := homeDedupeKey(homeItem)
 			if key == "" || used[key] {
 				continue
@@ -2080,6 +2296,7 @@ func (s *appState) collectManifestItems(ctx context.Context, mediaType string, l
 		}
 		for _, meta := range items {
 			homeItem := homeItemFromStremio(meta, mediaType)
+			s.applyCachedPlexArtworkToHomeItem(&homeItem)
 			key := homeDedupeKey(homeItem)
 			if key == "" || seen[key] {
 				continue
@@ -2350,6 +2567,7 @@ func (s *appState) searchManifestItems(ctx context.Context, query string, mediaT
 		}
 		for _, meta := range items {
 			homeItem := homeItemFromStremio(meta, catalogType)
+			s.applyCachedPlexArtworkToHomeItem(&homeItem)
 			if !homeItemMatchesSearch(homeItem, normalizedQuery) {
 				continue
 			}
@@ -2397,7 +2615,9 @@ func (s *appState) handleMovieByID(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusNotFound, "movie endpoint not found")
 		return
 	}
-	respondJSON(w, http.StatusOK, map[string]any{"movie": manifestDetailFromStremio(meta, "movie")})
+	detail := manifestDetailFromStremio(meta, "movie")
+	s.applyCachedPlexArtworkToHomeItem(&detail.vortexoHomeItem)
+	respondJSON(w, http.StatusOK, map[string]any{"movie": detail})
 }
 
 func (s *appState) handleSeriesByID(w http.ResponseWriter, r *http.Request) {
@@ -2428,7 +2648,9 @@ func (s *appState) handleSeriesByID(w http.ResponseWriter, r *http.Request) {
 
 	switch tail {
 	case "":
-		respondJSON(w, http.StatusOK, map[string]any{"series": manifestDetailFromStremio(meta, "series")})
+		detail := manifestDetailFromStremio(meta, "series")
+		s.applyCachedPlexArtworkToHomeItem(&detail.vortexoHomeItem)
+		respondJSON(w, http.StatusOK, map[string]any{"series": detail})
 	case "episodes":
 		respondJSON(w, http.StatusOK, map[string]any{"episodes": manifestEpisodesFromStremio(meta)})
 	default:
@@ -3922,6 +4144,841 @@ func youtubeLandscapeThumbnailURL(source string) string {
 		return ""
 	}
 	return "https://i.ytimg.com/vi/" + url.PathEscape(key) + "/hq720.jpg"
+}
+
+func (s *appState) runPlexArtworkSyncWorker(ctx context.Context) {
+	log.Printf("[PlexArtwork] worker starting interval=%s initialDelay=%s", plexArtworkSyncInterval, plexArtworkInitialDelay)
+	timer := time.NewTimer(plexArtworkInitialDelay)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("[PlexArtwork] worker stopping")
+			return
+		case <-timer.C:
+		}
+
+		if s.plexArtworkSyncMu.TryLock() {
+			stats, err := s.syncPlexArtworkCache(ctx, plexArtworkSyncLimit)
+			s.plexArtworkSyncMu.Unlock()
+			if err != nil {
+				log.Printf("[PlexArtwork] sync error: %v", err)
+			} else {
+				log.Printf("[PlexArtwork] sync complete attempted=%d ok=%d miss=%d skipped=%d failed=%d stopped=%q", stats.Attempted, stats.OK, stats.Miss, stats.Skipped, stats.Failed, stats.Stopped)
+			}
+		} else {
+			log.Printf("[PlexArtwork] sync skipped because another sync is running")
+		}
+
+		timer.Reset(plexArtworkSyncInterval)
+	}
+}
+
+func (s *appState) syncPlexArtworkCache(ctx context.Context, limit int) (*plexArtworkSyncStats, error) {
+	if limit <= 0 {
+		limit = plexArtworkSyncLimit
+	}
+	started := time.Now().UTC()
+	stats := &plexArtworkSyncStats{
+		Limit:     limit,
+		StartedAt: started,
+	}
+
+	staleBefore := time.Now().Add(-plexArtworkStaleAfter)
+	items := s.collectPlexArtworkSeedItems(ctx, limit, staleBefore)
+	stats.Attempted = len(items)
+	log.Printf("[PlexArtwork] starting sync selected=%d limit=%d delay=%s staleAfter=%s", len(items), limit, plexArtworkFetchDelay, plexArtworkStaleAfter)
+
+	for index, item := range items {
+		if err := ctx.Err(); err != nil {
+			stats.CompletedAt = time.Now().UTC()
+			return stats, err
+		}
+
+		idLabel := item.IMDBID
+		if item.TMDBID > 0 {
+			idLabel = "tmdb:" + strconv.Itoa(item.TMDBID)
+		}
+		label := fmt.Sprintf("%s:%s %s", normalizePlexArtworkMediaType(item.MediaType), idLabel, item.Title)
+		if plexArtworkKey(item.MediaType, item.TMDBID, item.IMDBID, item.Title, item.Year) == "" || strings.TrimSpace(item.Title) == "" {
+			stats.Skipped++
+			log.Printf("[PlexArtwork] skip %d/%d invalid item mediaType=%q tmdb=%d imdb=%q title=%q", index+1, len(items), item.MediaType, item.TMDBID, item.IMDBID, item.Title)
+			continue
+		}
+
+		entry, err := s.scrapePlexArtworkItem(ctx, item, plexArtworkFetchDelay)
+		if err != nil {
+			var stopErr *plexArtworkStopError
+			if errors.As(err, &stopErr) {
+				stats.Stopped = stopErr.Error()
+				stats.CompletedAt = time.Now().UTC()
+				log.Printf("[PlexArtwork] stop %d/%d %s: %v", index+1, len(items), label, err)
+				return stats, nil
+			}
+			stats.Failed++
+			_ = s.upsertPlexArtworkRecord(plexArtworkCacheRecord{
+				plexArtworkEntry: plexArtworkEntry{
+					Version:   1,
+					MediaType: item.MediaType,
+					TMDBID:    item.TMDBID,
+					IMDBID:    item.IMDBID,
+					Title:     item.Title,
+					Year:      item.Year,
+					UpdatedAt: time.Now().UTC(),
+					Artwork:   plexArtwork{},
+				},
+				Status: "error",
+				Error:  err.Error(),
+			})
+			log.Printf("[PlexArtwork] error %d/%d %s: %v", index+1, len(items), label, err)
+			continue
+		}
+
+		if entry == nil || entry.Artwork.isEmpty() {
+			stats.Miss++
+			_ = s.upsertPlexArtworkRecord(plexArtworkCacheRecord{
+				plexArtworkEntry: plexArtworkEntry{
+					Version:   1,
+					MediaType: item.MediaType,
+					TMDBID:    item.TMDBID,
+					IMDBID:    item.IMDBID,
+					Title:     item.Title,
+					Year:      item.Year,
+					UpdatedAt: time.Now().UTC(),
+					Artwork:   plexArtwork{},
+				},
+				Status: "miss",
+				Error:  "no public Plex artwork found",
+			})
+			log.Printf("[PlexArtwork] miss %d/%d %s", index+1, len(items), label)
+			continue
+		}
+
+		if err := s.upsertPlexArtworkRecord(plexArtworkCacheRecord{
+			plexArtworkEntry: *entry,
+			Status:           "ok",
+		}); err != nil {
+			stats.Failed++
+			log.Printf("[PlexArtwork] cache error %d/%d %s: %v", index+1, len(items), label, err)
+			continue
+		}
+		stats.OK++
+		log.Printf("[PlexArtwork] ok %d/%d %s source=%s artwork=%s", index+1, len(items), label, entry.SourcePage, plexArtworkSummary(entry.Artwork))
+	}
+
+	stats.CompletedAt = time.Now().UTC()
+	return stats, nil
+}
+
+func (s *appState) collectPlexArtworkSeedItems(ctx context.Context, limit int, staleBefore time.Time) []plexArtworkSeedItem {
+	if limit <= 0 {
+		limit = plexArtworkSyncLimit
+	}
+
+	seen := map[string]bool{}
+	items := make([]plexArtworkSeedItem, 0, limit)
+	add := func(seed plexArtworkSeedItem) {
+		if len(items) >= limit {
+			return
+		}
+		seed.MediaType = normalizePlexArtworkMediaType(seed.MediaType)
+		seed.Title = strings.TrimSpace(seed.Title)
+		seed.IMDBID = imdbFromID(seed.IMDBID)
+		if seed.Title == "" {
+			return
+		}
+		key := plexArtworkKey(seed.MediaType, seed.TMDBID, seed.IMDBID, seed.Title, seed.Year)
+		if key == "" || seen[key] || !s.plexArtworkSeedNeedsRefresh(seed, staleBefore) {
+			return
+		}
+		seen[key] = true
+		items = append(items, seed)
+	}
+
+	s.mu.RLock()
+	watchItems := append([]watchStateItem(nil), s.watchState.Items...)
+	s.mu.RUnlock()
+	sort.SliceStable(watchItems, func(i, j int) bool {
+		return watchItems[i].UpdatedAt.After(watchItems[j].UpdatedAt)
+	})
+	for _, item := range watchItems {
+		if seed, ok := plexArtworkSeedFromWatchState(item); ok {
+			add(seed)
+		}
+	}
+
+	for _, entry := range s.enabledCatalogEntries(ctx) {
+		if len(items) >= limit {
+			break
+		}
+		if !manifestSupportsResource(entry.Manifest, "catalog") {
+			continue
+		}
+		mediaType := normalizeCatalogType(entry.Catalog.Type)
+		if mediaType == "" {
+			continue
+		}
+		metas, err := s.fetchCatalog(ctx, entry.Base, entry.Catalog, plexArtworkSeedCatalogLimit)
+		if err != nil {
+			log.Printf("[PlexArtwork] seed catalog %s/%s failed: %v", entry.Catalog.Type, entry.Catalog.ID, err)
+			continue
+		}
+		for _, meta := range metas {
+			homeItem := homeItemFromStremio(meta, mediaType)
+			if seed, ok := plexArtworkSeedFromHomeItem(homeItem); ok {
+				add(seed)
+			}
+			if len(items) >= limit {
+				break
+			}
+		}
+	}
+
+	return items
+}
+
+func (s *appState) plexArtworkSeedNeedsRefresh(seed plexArtworkSeedItem, staleBefore time.Time) bool {
+	record, ok := s.getCachedPlexArtwork(seed.MediaType, seed.TMDBID, seed.IMDBID, seed.Title, seed.Year)
+	if !ok {
+		return true
+	}
+	if record.Status != "ok" {
+		return record.FetchedAt.Before(time.Now().Add(-24 * time.Hour))
+	}
+	return record.FetchedAt.IsZero() || record.FetchedAt.Before(staleBefore)
+}
+
+func (s *appState) findPlexArtworkSeedItem(ctx context.Context, mediaType string, tmdbID int) plexArtworkSeedItem {
+	normalizedType := normalizePlexArtworkMediaType(mediaType)
+	s.mu.RLock()
+	watchItems := append([]watchStateItem(nil), s.watchState.Items...)
+	s.mu.RUnlock()
+	for _, item := range watchItems {
+		seed, ok := plexArtworkSeedFromWatchState(item)
+		if ok && seed.TMDBID == tmdbID && normalizePlexArtworkMediaType(seed.MediaType) == normalizedType {
+			return seed
+		}
+	}
+
+	for _, entry := range s.enabledCatalogEntries(ctx) {
+		if !manifestSupportsResource(entry.Manifest, "catalog") {
+			continue
+		}
+		catalogType := normalizeCatalogType(entry.Catalog.Type)
+		if normalizePlexArtworkMediaType(catalogType) != normalizedType {
+			continue
+		}
+		metas, err := s.fetchCatalog(ctx, entry.Base, entry.Catalog, plexArtworkSeedCatalogLimit)
+		if err != nil {
+			continue
+		}
+		for _, meta := range metas {
+			homeItem := homeItemFromStremio(meta, catalogType)
+			seed, ok := plexArtworkSeedFromHomeItem(homeItem)
+			if ok && seed.TMDBID == tmdbID {
+				return seed
+			}
+		}
+	}
+
+	return plexArtworkSeedItem{MediaType: normalizedType, TMDBID: tmdbID}
+}
+
+func (s *appState) refreshPlexArtworkSeed(ctx context.Context, item plexArtworkSeedItem) (*plexArtworkCacheRecord, error) {
+	entry, err := s.scrapePlexArtworkItem(ctx, item, plexArtworkFetchDelay)
+	if err != nil {
+		var stopErr *plexArtworkStopError
+		if !errors.As(err, &stopErr) {
+			return nil, err
+		}
+	}
+
+	status := "ok"
+	errorMessage := ""
+	if entry == nil || entry.Artwork.isEmpty() {
+		status = "miss"
+		errorMessage = "no public Plex artwork found"
+		if err != nil {
+			errorMessage = err.Error()
+		}
+		entry = &plexArtworkEntry{
+			Version:   1,
+			MediaType: item.MediaType,
+			TMDBID:    item.TMDBID,
+			IMDBID:    item.IMDBID,
+			Title:     item.Title,
+			Year:      item.Year,
+			UpdatedAt: time.Now().UTC(),
+			Artwork:   plexArtwork{},
+		}
+	}
+
+	record := plexArtworkCacheRecord{
+		plexArtworkEntry: *entry,
+		Status:           status,
+		Error:            errorMessage,
+	}
+	if err := s.upsertPlexArtworkRecord(record); err != nil {
+		return nil, err
+	}
+	saved, _ := s.getCachedPlexArtwork(record.MediaType, record.TMDBID, record.IMDBID, record.Title, record.Year)
+	return &saved, nil
+}
+
+func (s *appState) scrapePlexArtworkItem(ctx context.Context, item plexArtworkSeedItem, delay time.Duration) (*plexArtworkEntry, error) {
+	for _, pageURL := range candidatePlexArtworkURLs(item) {
+		body, err := s.fetchPlexArtworkPage(ctx, pageURL, delay)
+		if err != nil {
+			var stopErr *plexArtworkStopError
+			if errors.As(err, &stopErr) {
+				return nil, err
+			}
+			log.Printf("[PlexArtwork] fetch miss %s:%d %s %v", item.MediaType, item.TMDBID, pageURL, err)
+			continue
+		}
+
+		artwork := structuredPlexArtwork(body)
+		if artwork.isEmpty() {
+			continue
+		}
+
+		return &plexArtworkEntry{
+			Version:    1,
+			MediaType:  normalizePlexArtworkMediaType(item.MediaType),
+			TMDBID:     item.TMDBID,
+			IMDBID:     item.IMDBID,
+			Title:      item.Title,
+			Year:       item.Year,
+			SourcePage: pageURL,
+			UpdatedAt:  time.Now().UTC(),
+			Artwork:    artwork,
+		}, nil
+	}
+	return nil, nil
+}
+
+func (s *appState) fetchPlexArtworkPage(ctx context.Context, pageURL string, delay time.Duration) (string, error) {
+	if err := s.waitForPlexArtworkSlot(ctx, delay); err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("User-Agent", "Mozilla/5.0 VortexoArtworkCache")
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		retryAfter := strings.TrimSpace(resp.Header.Get("Retry-After"))
+		if retryAfter != "" {
+			return "", &plexArtworkStopError{message: fmt.Sprintf("Plex returned HTTP %d retryAfter=%s url=%s", resp.StatusCode, retryAfter, pageURL)}
+		}
+		return "", &plexArtworkStopError{message: fmt.Sprintf("Plex returned HTTP %d url=%s", resp.StatusCode, pageURL)}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("HTTP %d %s", resp.StatusCode, pageURL)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	body := string(data)
+	if isPlexCloudflareChallenge(body) {
+		return "", &plexArtworkStopError{message: fmt.Sprintf("Cloudflare challenge detected url=%s", pageURL)}
+	}
+	return body, nil
+}
+
+func (s *appState) waitForPlexArtworkSlot(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+
+	s.plexArtworkRequestMu.Lock()
+	wait := time.Duration(0)
+	if !s.plexArtworkLastRequestAt.IsZero() {
+		elapsed := time.Since(s.plexArtworkLastRequestAt)
+		if elapsed < delay {
+			wait = delay - elapsed
+		}
+	}
+	s.plexArtworkRequestMu.Unlock()
+
+	if wait > 0 {
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+
+	s.plexArtworkRequestMu.Lock()
+	s.plexArtworkLastRequestAt = time.Now()
+	s.plexArtworkRequestMu.Unlock()
+	return nil
+}
+
+func (s *appState) applyCachedPlexArtworkToHomeItem(item *vortexoHomeItem) {
+	if item == nil {
+		return
+	}
+	seed, ok := plexArtworkSeedFromHomeItem(*item)
+	if !ok {
+		return
+	}
+	record, ok := s.getCachedPlexArtwork(seed.MediaType, seed.TMDBID, seed.IMDBID, seed.Title, seed.Year)
+	if !ok || record.Status != "ok" || record.Artwork.isEmpty() {
+		return
+	}
+	if landscape := firstPlexArtworkURL(record.Artwork.Landscape, record.Artwork.CoverArt); landscape != "" {
+		item.LandscapePath = landscape
+	}
+	if background := firstPlexArtworkURL(record.Artwork.Background); background != "" {
+		item.BackdropPath = background
+	}
+	if logo := firstPlexArtworkURL(record.Artwork.ClearLogo); logo != "" {
+		item.LogoPath = logo
+	}
+	if item.PosterPath == "" {
+		item.PosterPath = firstPlexArtworkURL(record.Artwork.Thumbnail)
+	}
+}
+
+func (s *appState) applyCachedPlexArtworkToWatchStateItem(item *watchStateItem) {
+	if item == nil {
+		return
+	}
+	seed, ok := plexArtworkSeedFromWatchState(*item)
+	if !ok {
+		return
+	}
+	record, ok := s.getCachedPlexArtwork(seed.MediaType, seed.TMDBID, seed.IMDBID, seed.Title, seed.Year)
+	if !ok || record.Status != "ok" || record.Artwork.isEmpty() {
+		return
+	}
+	if landscape := firstPlexArtworkURL(record.Artwork.Landscape, record.Artwork.CoverArt); landscape != "" {
+		item.LandscapePath = landscape
+	}
+	if background := firstPlexArtworkURL(record.Artwork.Background); background != "" {
+		item.BackdropPath = background
+	}
+	if logo := firstPlexArtworkURL(record.Artwork.ClearLogo); logo != "" {
+		item.LogoPath = logo
+	}
+	if item.PosterPath == "" {
+		item.PosterPath = firstPlexArtworkURL(record.Artwork.Thumbnail)
+	}
+}
+
+func (s *appState) getCachedPlexArtwork(mediaType string, tmdbID int, imdbID string, title string, year int) (plexArtworkCacheRecord, bool) {
+	keys := uniqueNonEmptyStrings([]string{
+		plexArtworkKey(mediaType, tmdbID, "", "", 0),
+		plexArtworkKey(mediaType, 0, imdbID, "", 0),
+		plexArtworkKey(mediaType, 0, "", title, year),
+	})
+	s.plexArtworkMu.RLock()
+	defer s.plexArtworkMu.RUnlock()
+	for _, key := range keys {
+		if record, ok := s.plexArtwork[key]; ok {
+			return record, true
+		}
+	}
+	return plexArtworkCacheRecord{}, false
+}
+
+func (s *appState) upsertPlexArtworkRecord(record plexArtworkCacheRecord) error {
+	record.MediaType = normalizePlexArtworkMediaType(record.MediaType)
+	record.IMDBID = imdbFromID(record.IMDBID)
+	if record.Version == 0 {
+		record.Version = 1
+	}
+	if record.UpdatedAt.IsZero() {
+		record.UpdatedAt = time.Now().UTC()
+	}
+	if record.FetchedAt.IsZero() {
+		record.FetchedAt = time.Now().UTC()
+	}
+	if record.Status == "" {
+		record.Status = "ok"
+	}
+	record.Artwork = dedupePlexArtwork(record.Artwork)
+
+	key := plexArtworkKey(record.MediaType, record.TMDBID, record.IMDBID, record.Title, record.Year)
+	if key == "" {
+		return fmt.Errorf("invalid plex artwork cache key")
+	}
+
+	s.plexArtworkMu.Lock()
+	if s.plexArtwork == nil {
+		s.plexArtwork = map[string]plexArtworkCacheRecord{}
+	}
+	s.plexArtwork[key] = record
+	snapshot := make([]plexArtworkCacheRecord, 0, len(s.plexArtwork))
+	for _, item := range s.plexArtwork {
+		snapshot = append(snapshot, item)
+	}
+	s.plexArtworkMu.Unlock()
+
+	return s.savePlexArtworkCacheSnapshot(snapshot)
+}
+
+func plexArtworkSeedFromHomeItem(item vortexoHomeItem) (plexArtworkSeedItem, bool) {
+	seed := plexArtworkSeedItem{
+		MediaType: item.MediaType,
+		TMDBID:    item.TMDBID,
+		IMDBID:    item.IMDBID,
+		Title:     item.Title,
+		Year:      item.Year,
+	}
+	return seed, plexArtworkKey(seed.MediaType, seed.TMDBID, seed.IMDBID, seed.Title, seed.Year) != ""
+}
+
+func plexArtworkSeedFromWatchState(item watchStateItem) (plexArtworkSeedItem, bool) {
+	mediaType := strings.ToLower(strings.TrimSpace(item.MediaType))
+	switch mediaType {
+	case "movie":
+		seed := plexArtworkSeedItem{
+			MediaType: "movie",
+			TMDBID:    item.TMDBID,
+			IMDBID:    item.IMDBID,
+			Title:     item.Title,
+			Year:      item.Year,
+		}
+		return seed, plexArtworkKey(seed.MediaType, seed.TMDBID, seed.IMDBID, seed.Title, seed.Year) != ""
+	case "episode":
+		seed := plexArtworkSeedItem{
+			MediaType: "tv",
+			TMDBID:    item.TMDBID,
+			IMDBID:    item.IMDBID,
+			Title:     firstNonEmpty(item.ParentTitle, item.Title),
+			Year:      item.Year,
+		}
+		return seed, plexArtworkKey(seed.MediaType, seed.TMDBID, seed.IMDBID, seed.Title, seed.Year) != ""
+	default:
+		return plexArtworkSeedItem{}, false
+	}
+}
+
+func candidatePlexArtworkURLs(item plexArtworkSeedItem) []string {
+	kind := "movie"
+	if normalizePlexArtworkMediaType(item.MediaType) == "tv" {
+		kind = "show"
+	}
+
+	slug := slugifyPlexArtworkTitle(item.Title)
+	var paths []string
+	if slug != "" {
+		if item.Year > 0 {
+			paths = append(paths, fmt.Sprintf("/en-GB/%s/%s-%d", kind, slug, item.Year))
+		}
+		paths = append(paths, fmt.Sprintf("/en-GB/%s/%s", kind, slug))
+	}
+
+	seen := map[string]bool{}
+	urls := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.ReplaceAll(path, `\u002F`, "/")
+		path = strings.ReplaceAll(path, `\/`, "/")
+		path = strings.ReplaceAll(path, "&amp;", "&")
+		if !strings.HasPrefix(path, "/") || seen[path] {
+			continue
+		}
+		seen[path] = true
+		urls = append(urls, "https://watch.plex.tv"+path)
+	}
+	return urls
+}
+
+func structuredPlexArtwork(rawHTML string) plexArtwork {
+	normalized := normalizePlexArtworkHTML(rawHTML)
+	artwork := plexArtwork{}
+
+	if landscape := structuredPlexLandscapeTileURL(normalized); landscape != "" {
+		artwork.CoverArt = append(artwork.CoverArt, landscape)
+		artwork.Landscape = append(artwork.Landscape, landscape)
+	}
+	if background := structuredPlexImageURL(normalized, "background"); background != "" {
+		artwork.Background = append(artwork.Background, background)
+	}
+	if landscape := structuredPlexImageURL(normalized, "backgroundLandscape"); landscape != "" {
+		artwork.Background = append(artwork.Background, landscape)
+	}
+	if logo := structuredPlexClearLogoURL(normalized); logo != "" {
+		artwork.ClearLogo = append(artwork.ClearLogo, logo)
+	}
+	if preload := preloadedPlexImageURL(normalized); preload != "" {
+		artwork.Background = append(artwork.Background, preload)
+	}
+	if social := metaPlexImageURL(normalized, "property", "og:image"); social != "" {
+		artwork.Thumbnail = append(artwork.Thumbnail, social)
+	} else if social := metaPlexImageURL(normalized, "name", "twitter:image"); social != "" {
+		artwork.Thumbnail = append(artwork.Thumbnail, social)
+	}
+
+	return dedupePlexArtwork(artwork)
+}
+
+func structuredPlexImageURL(rawHTML, field string) string {
+	pattern := fmt.Sprintf(`"%s":\{"image":\{"url":"([^"]+)"`, regexp.QuoteMeta(field))
+	matches := regexp.MustCompile(pattern).FindStringSubmatch(rawHTML)
+	if len(matches) < 2 {
+		return ""
+	}
+	decoded := decodePlexArtworkURL(matches[1])
+	if isValidPlexArtworkURL(decoded) {
+		return decoded
+	}
+	return ""
+}
+
+func structuredPlexLandscapeTileURL(rawHTML string) string {
+	re := regexp.MustCompile(`"orientation":"landscape","size":"m","id":"[^"]*/extras/[^"]+","image":\{"url":"([^"]+)"`)
+	for _, matches := range re.FindAllStringSubmatch(rawHTML, -1) {
+		if len(matches) < 2 {
+			continue
+		}
+		decoded := decodePlexArtworkURL(matches[1])
+		if strings.Contains(decoded, "provider-static.plex.tv/discover/logos/p/") {
+			continue
+		}
+		if isValidPlexArtworkURL(decoded) {
+			return decoded
+		}
+	}
+	return ""
+}
+
+func structuredPlexClearLogoURL(rawHTML string) string {
+	re := regexp.MustCompile(`"clearLogo":\{"url":"([^"]+)"`)
+	for _, matches := range re.FindAllStringSubmatch(rawHTML, -1) {
+		if len(matches) < 2 {
+			continue
+		}
+		decoded := decodePlexArtworkURL(matches[1])
+		if strings.Contains(decoded, "provider-static.plex.tv/discover/logos/p/") {
+			continue
+		}
+		if isValidPlexArtworkURL(decoded) {
+			return decoded
+		}
+	}
+	return ""
+}
+
+func preloadedPlexImageURL(rawHTML string) string {
+	for _, tag := range htmlTags("link", rawHTML) {
+		if !strings.EqualFold(htmlAttribute("as", tag), "image") {
+			continue
+		}
+		if largest := largestPlexImageURL(htmlAttribute("imageSrcSet", tag)); largest != "" {
+			return largest
+		}
+	}
+	return ""
+}
+
+func largestPlexImageURL(srcset string) string {
+	if strings.TrimSpace(srcset) == "" {
+		return ""
+	}
+
+	var candidates []string
+	for _, raw := range strings.Split(srcset, ",") {
+		fields := strings.Fields(strings.TrimSpace(raw))
+		if len(fields) == 0 {
+			continue
+		}
+		candidate := html.UnescapeString(fields[0])
+		if candidate != "" {
+			candidates = append(candidates, candidate)
+		}
+	}
+	if len(candidates) == 0 {
+		return ""
+	}
+	return candidates[len(candidates)-1]
+}
+
+func metaPlexImageURL(rawHTML, keyAttribute, keyValue string) string {
+	for _, tag := range htmlTags("meta", rawHTML) {
+		if !strings.EqualFold(htmlAttribute(keyAttribute, tag), keyValue) {
+			continue
+		}
+		if content := htmlAttribute("content", tag); content != "" {
+			return html.UnescapeString(content)
+		}
+	}
+	return ""
+}
+
+func htmlTags(name, rawHTML string) []string {
+	re := regexp.MustCompile(`(?is)<` + regexp.QuoteMeta(name) + `\b[^>]*>`)
+	return re.FindAllString(rawHTML, -1)
+}
+
+func htmlAttribute(name, tag string) string {
+	re := regexp.MustCompile(`(?i)\s` + regexp.QuoteMeta(name) + `="([^"]*)"`)
+	matches := re.FindStringSubmatch(tag)
+	if len(matches) < 2 {
+		return ""
+	}
+	return matches[1]
+}
+
+func normalizePlexArtworkHTML(value string) string {
+	value = strings.ReplaceAll(value, `\u002F`, "/")
+	value = strings.ReplaceAll(value, `\/`, "/")
+	value = strings.ReplaceAll(value, "&amp;", "&")
+	return value
+}
+
+func decodePlexArtworkURL(value string) string {
+	decoded := html.UnescapeString(value)
+	decoded = strings.ReplaceAll(decoded, `\u002F`, "/")
+	decoded = strings.ReplaceAll(decoded, `\/`, "/")
+	return decoded
+}
+
+func isValidPlexArtworkURL(value string) bool {
+	if strings.TrimSpace(value) == "" {
+		return false
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	return host == "metadata-static.plex.tv" ||
+		strings.HasSuffix(host, ".metadata-static.plex.tv") ||
+		host == "provider-static.plex.tv" ||
+		strings.HasSuffix(host, ".provider-static.plex.tv") ||
+		host == "images.plex.tv" ||
+		strings.HasSuffix(host, ".images.plex.tv")
+}
+
+func dedupePlexArtwork(artwork plexArtwork) plexArtwork {
+	artwork.CoverArt = uniqueNonEmptyStrings(artwork.CoverArt)
+	artwork.Landscape = uniqueNonEmptyStrings(artwork.Landscape)
+	artwork.Background = uniqueNonEmptyStrings(artwork.Background)
+	artwork.ClearLogo = uniqueNonEmptyStrings(artwork.ClearLogo)
+	artwork.Thumbnail = uniqueNonEmptyStrings(artwork.Thumbnail)
+	return artwork
+}
+
+func isPlexCloudflareChallenge(body string) bool {
+	return strings.Contains(body, "cf_chl_") ||
+		strings.Contains(body, "cf-browser-verification") ||
+		strings.Contains(body, "challenge-platform") ||
+		strings.Contains(body, "<title>Just a moment...</title>")
+}
+
+func slugifyPlexArtworkTitle(title string) string {
+	title = strings.ToLower(strings.TrimSpace(title))
+	var builder strings.Builder
+	lastDash := false
+
+	for _, r := range title {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			builder.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if r == '&' {
+			if !lastDash && builder.Len() > 0 {
+				builder.WriteByte('-')
+			}
+			builder.WriteString("and")
+			lastDash = false
+			continue
+		}
+		if !lastDash && builder.Len() > 0 {
+			builder.WriteByte('-')
+			lastDash = true
+		}
+	}
+
+	return strings.Trim(builder.String(), "-")
+}
+
+func normalizePlexArtworkMediaType(value string) string {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	switch normalized {
+	case "show", "series", "episode":
+		return "tv"
+	default:
+		return normalized
+	}
+}
+
+func plexArtworkKey(mediaType string, tmdbID int, imdbID string, title string, year int) string {
+	normalizedType := normalizePlexArtworkMediaType(mediaType)
+	if normalizedType == "" {
+		return ""
+	}
+	if tmdbID > 0 {
+		return normalizedType + ":tmdb:" + strconv.Itoa(tmdbID)
+	}
+	if id := imdbFromID(imdbID); id != "" {
+		return normalizedType + ":imdb:" + strings.ToLower(id)
+	}
+	if slug := slugifyPlexArtworkTitle(title); slug != "" {
+		if year > 0 {
+			return normalizedType + ":title:" + slug + ":" + strconv.Itoa(year)
+		}
+		return normalizedType + ":title:" + slug
+	}
+	return ""
+}
+
+func firstPlexArtworkURL(groups ...[]string) string {
+	for _, group := range groups {
+		for _, value := range group {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return ""
+}
+
+func plexArtworkSummary(artwork plexArtwork) string {
+	counts := map[string]int{
+		"coverArt":   len(artwork.CoverArt),
+		"landscape":  len(artwork.Landscape),
+		"background": len(artwork.Background),
+		"clearLogo":  len(artwork.ClearLogo),
+		"thumbnail":  len(artwork.Thumbnail),
+	}
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s:%d", key, counts[key]))
+	}
+	return strings.Join(parts, ",")
+}
+
+type plexArtworkStopError struct {
+	message string
+}
+
+func (e *plexArtworkStopError) Error() string {
+	return e.message
 }
 
 func xtreamMovieInfoFromStremio(meta stremioMeta) map[string]any {
