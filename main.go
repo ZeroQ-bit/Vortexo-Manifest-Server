@@ -60,6 +60,9 @@ type appState struct {
 	plexArtworkMu            sync.RWMutex
 	plexArtwork              map[string]plexArtworkCacheRecord
 	plexArtworkSyncMu        sync.Mutex
+	plexArtworkSyncStateMu   sync.RWMutex
+	plexArtworkSyncRunning   bool
+	plexArtworkLastSync      *plexArtworkSyncStats
 	plexArtworkRequestMu     sync.Mutex
 	plexArtworkLastRequestAt time.Time
 }
@@ -709,6 +712,23 @@ type plexArtworkSyncStats struct {
 	CompletedAt time.Time `json:"completedAt"`
 }
 
+type plexArtworkDashboardStats struct {
+	Total          int                   `json:"total"`
+	OK             int                   `json:"ok"`
+	CleanLandscape int                   `json:"clean_landscape"`
+	BackdropOnly   int                   `json:"backdrop_only"`
+	WithLogo       int                   `json:"with_logo"`
+	Miss           int                   `json:"miss"`
+	Error          int                   `json:"error"`
+	SignedDiscover int                   `json:"signed_discover"`
+	PublicFallback int                   `json:"public_fallback"`
+	Running        bool                  `json:"running"`
+	HasPlexToken   bool                  `json:"has_plex_token"`
+	LastFetchedAt  time.Time             `json:"last_fetched_at,omitempty"`
+	LastUpdatedAt  time.Time             `json:"last_updated_at,omitempty"`
+	LastSync       *plexArtworkSyncStats `json:"last_sync,omitempty"`
+}
+
 func (a plexArtwork) isEmpty() bool {
 	return len(a.CoverArt) == 0 &&
 		len(a.Landscape) == 0 &&
@@ -910,6 +930,7 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/discover/trending", s.handleDiscoverList)
 	mux.HandleFunc("/api/v1/discover/popular", s.handleDiscoverList)
 	mux.HandleFunc("/api/v1/artwork/refresh", s.requireAuth(s.handlePlexArtworkRefresh))
+	mux.HandleFunc("/api/v1/artwork/status", s.requireAuth(s.handlePlexArtworkStatus))
 	mux.HandleFunc("/api/v1/artwork/", s.handlePlexArtworkByID)
 	mux.HandleFunc("/api/v1/vortexo/capabilities", s.handleCapabilities)
 	mux.HandleFunc("/api/v1/vortexo/home", s.handleVortexoHome)
@@ -1093,6 +1114,90 @@ func (s *appState) savePlexArtworkCacheSnapshot(records []plexArtworkCacheRecord
 		return err
 	}
 	return os.WriteFile(filepath.Join(s.dataDir, "plex_artwork_cache.json"), data, 0o600)
+}
+
+func (s *appState) plexArtworkDashboardStats() plexArtworkDashboardStats {
+	s.plexArtworkMu.RLock()
+	records := make([]plexArtworkCacheRecord, 0, len(s.plexArtwork))
+	for _, record := range s.plexArtwork {
+		records = append(records, record)
+	}
+	s.plexArtworkMu.RUnlock()
+
+	stats := plexArtworkDashboardStats{
+		Total:        len(records),
+		Running:      s.isPlexArtworkSyncRunning(),
+		HasPlexToken: s.plexAccountToken() != "",
+		LastSync:     s.lastPlexArtworkSyncStats(),
+	}
+	for _, record := range records {
+		switch strings.ToLower(strings.TrimSpace(record.Status)) {
+		case "ok":
+			stats.OK++
+			hasCleanLandscape := len(record.Artwork.Landscape) > 0 || len(record.Artwork.CoverArt) > 0
+			if hasCleanLandscape {
+				stats.CleanLandscape++
+			} else if len(record.Artwork.Background) > 0 {
+				stats.BackdropOnly++
+			}
+			if len(record.Artwork.ClearLogo) > 0 {
+				stats.WithLogo++
+			}
+			if isSignedPlexArtworkSource(record.SourcePage) {
+				stats.SignedDiscover++
+			} else if strings.TrimSpace(record.SourcePage) != "" {
+				stats.PublicFallback++
+			}
+		case "miss":
+			stats.Miss++
+		case "error":
+			stats.Error++
+		}
+		if record.FetchedAt.After(stats.LastFetchedAt) {
+			stats.LastFetchedAt = record.FetchedAt
+		}
+		if record.UpdatedAt.After(stats.LastUpdatedAt) {
+			stats.LastUpdatedAt = record.UpdatedAt
+		}
+	}
+	return stats
+}
+
+func isSignedPlexArtworkSource(source string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(source))
+	return strings.HasPrefix(normalized, "plex-discover:") || strings.Contains(normalized, "discover.provider.plex.tv")
+}
+
+func (s *appState) isPlexArtworkSyncRunning() bool {
+	s.plexArtworkSyncStateMu.RLock()
+	defer s.plexArtworkSyncStateMu.RUnlock()
+	return s.plexArtworkSyncRunning
+}
+
+func (s *appState) setPlexArtworkSyncRunning(running bool) {
+	s.plexArtworkSyncStateMu.Lock()
+	s.plexArtworkSyncRunning = running
+	s.plexArtworkSyncStateMu.Unlock()
+}
+
+func (s *appState) rememberPlexArtworkSyncStats(stats *plexArtworkSyncStats) {
+	if stats == nil {
+		return
+	}
+	clone := *stats
+	s.plexArtworkSyncStateMu.Lock()
+	s.plexArtworkLastSync = &clone
+	s.plexArtworkSyncStateMu.Unlock()
+}
+
+func (s *appState) lastPlexArtworkSyncStats() *plexArtworkSyncStats {
+	s.plexArtworkSyncStateMu.RLock()
+	defer s.plexArtworkSyncStateMu.RUnlock()
+	if s.plexArtworkLastSync == nil {
+		return nil
+	}
+	clone := *s.plexArtworkLastSync
+	return &clone
 }
 
 func (s *appState) withCORS(next http.Handler) http.Handler {
@@ -1810,6 +1915,7 @@ func (s *appState) handleBridgeDashboard(w http.ResponseWriter, r *http.Request)
 		"manifests":    manifests,
 		"catalogs":     allCatalogs,
 		"registry_url": registryURL,
+		"artwork":      s.plexArtworkDashboardStats(),
 		"watch": map[string]any{
 			"count":               watchCount,
 			"updated_at":          watchUpdatedAt,
@@ -2279,10 +2385,15 @@ func (s *appState) handlePlexArtworkRefresh(w http.ResponseWriter, r *http.Reque
 		respondError(w, http.StatusConflict, "plex artwork sync is already running")
 		return
 	}
+	s.setPlexArtworkSyncRunning(true)
 
 	go func() {
-		defer s.plexArtworkSyncMu.Unlock()
+		defer func() {
+			s.setPlexArtworkSyncRunning(false)
+			s.plexArtworkSyncMu.Unlock()
+		}()
 		stats, err := s.syncPlexArtworkCache(context.Background(), limit)
+		s.rememberPlexArtworkSyncStats(stats)
 		if err != nil {
 			log.Printf("[PlexArtwork] manual sync error: %v", err)
 			return
@@ -2294,6 +2405,14 @@ func (s *appState) handlePlexArtworkRefresh(w http.ResponseWriter, r *http.Reque
 		"message": "Plex artwork sync triggered",
 		"limit":   limit,
 	})
+}
+
+func (s *appState) handlePlexArtworkStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"artwork": s.plexArtworkDashboardStats()})
 }
 
 func (s *appState) handlePlexArtworkByID(w http.ResponseWriter, r *http.Request) {
@@ -4580,7 +4699,10 @@ func (s *appState) runPlexArtworkSyncWorker(ctx context.Context) {
 		}
 
 		if s.plexArtworkSyncMu.TryLock() {
+			s.setPlexArtworkSyncRunning(true)
 			stats, err := s.syncPlexArtworkCache(ctx, plexArtworkSyncLimit)
+			s.rememberPlexArtworkSyncStats(stats)
+			s.setPlexArtworkSyncRunning(false)
 			s.plexArtworkSyncMu.Unlock()
 			if err != nil {
 				log.Printf("[PlexArtwork] sync error: %v", err)

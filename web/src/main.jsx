@@ -44,6 +44,7 @@ const NAV = [
 const emptyDashboard = {
   manifests: [],
   catalogs: [],
+  artwork: {},
   watch: {},
   server: {},
   registry_url: DEFAULT_REGISTRY_URL,
@@ -114,6 +115,7 @@ function App() {
       liveProviders,
       broken,
       watchItems: dashboard.watch?.count || 0,
+      artworkClean: dashboard.artwork?.clean_landscape || 0,
     };
   }, [dashboard]);
 
@@ -732,6 +734,7 @@ function App() {
                 onSave={saveWatch}
                 onSync={syncWatch}
                 plex={plexSettings}
+                artwork={dashboard.artwork || {}}
                 plexAccessToken={plexAccessToken}
                 setPlexAccessToken={setPlexAccessToken}
                 plexPin={plexPin}
@@ -768,13 +771,17 @@ function App() {
 
 function Overview({ summary, dashboard, homeRows }) {
   const previewRows = (homeRows || []).slice(0, 5);
+  const artwork = dashboard.artwork || {};
+  const artworkGaps = (artwork.miss || 0) + (artwork.error || 0);
+  const artworkStatus = artwork.running ? "sync running" : artwork.has_plex_token ? "Plex connected" : "Plex missing";
   return (
     <section className="stack">
-      <div className="metric-grid">
+      <div className="metric-grid overview-grid">
         <Metric icon={Database} label="Installed add-ons" value={summary.manifests} detail={`${summary.enabled} enabled`} />
         <Metric icon={Library} label="Catalog rows" value={summary.activeCatalogs} detail={`${summary.catalogs} managed`} />
         <Metric icon={Play} label="Stream providers" value={summary.streamProviders} detail={`${summary.subtitleProviders} subtitle providers`} />
         <Metric icon={Eye} label="Watch items" value={summary.watchItems} detail={dashboard.watch?.trakt_connected ? "Trakt connected" : "Local state"} />
+        <Metric icon={Clapperboard} label="Plex artwork" value={summary.artworkClean} detail={`${artwork.total || 0} cached · ${artworkStatus}`} />
       </div>
 
       <div className="panel split-panel">
@@ -792,6 +799,10 @@ function Overview({ summary, dashboard, homeRows }) {
           <HealthRow ok={summary.activeCatalogs > 0} label="Catalogs" value={`${summary.activeCatalogs} active`} />
           <HealthRow ok={summary.streamProviders > 0} label="Streams" value={`${summary.streamProviders} providers`} />
           <HealthRow ok={summary.broken === 0} label="Errors" value={summary.broken === 0 ? "None" : `${summary.broken} found`} />
+          <HealthRow ok={(artwork.clean_landscape || 0) > 0} label="Clean landscapes" value={`${artwork.clean_landscape || 0} items`} />
+          <HealthRow ok={(artwork.backdrop_only || 0) === 0} label="Backdrop-only" value={`${artwork.backdrop_only || 0} items`} />
+          <HealthRow ok={artworkGaps === 0} label="Artwork gaps" value={artworkGaps === 0 ? "None" : `${artworkGaps} items`} />
+          <HealthRow ok={(artwork.signed_discover || 0) > 0} label="Signed Discover" value={`${artwork.signed_discover || 0} hits`} />
         </div>
       </div>
 
@@ -1172,6 +1183,7 @@ function WatchSync({
   onSave,
   onSync,
   plex,
+  artwork,
   plexAccessToken,
   setPlexAccessToken,
   plexPin,
@@ -1190,6 +1202,7 @@ function WatchSync({
   ].filter(Boolean);
   const plexName = plex?.username || plex?.title || plex?.email || "";
   const plexLink = plexPin?.authorization_url || plexPin?.verification_url || "https://plex.tv/link";
+  const artworkGaps = (artwork?.miss || 0) + (artwork?.error || 0);
   return (
     <section className="stack">
       <div className="metric-grid two-cols">
@@ -1224,6 +1237,13 @@ function WatchSync({
               {plex?.has_access_token
                 ? `Connected${plexName ? ` as ${plexName}` : ""}.`
                 : "Connect Plex so add-on media can use enhanced Discover 16:9 art."}
+            </p>
+            <p className="muted">
+              Clean landscapes: <strong>{artwork?.clean_landscape || 0}</strong>
+              {" "}· cached: <strong>{artwork?.total || 0}</strong>
+              {" "}· backdrop-only: <strong>{artwork?.backdrop_only || 0}</strong>
+              {" "}· gaps: <strong>{artworkGaps}</strong>
+              {artwork?.running ? " · sync running" : ""}
             </p>
           </div>
           <span className={plex?.has_access_token ? "small-status ok" : "small-status warn"}>
