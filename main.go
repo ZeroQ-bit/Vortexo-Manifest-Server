@@ -735,6 +735,26 @@ type plexDiscoverGuid struct {
 	ID string `json:"id,omitempty"`
 }
 
+type plexDiscoverFloat float64
+
+func (value *plexDiscoverFloat) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" || trimmed == `""` || trimmed == "[]" {
+		*value = 0
+		return nil
+	}
+	if strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{") {
+		*value = 0
+		return nil
+	}
+	if parsed, err := strconv.ParseFloat(strings.Trim(trimmed, `"`), 64); err == nil {
+		*value = plexDiscoverFloat(parsed)
+		return nil
+	}
+	*value = 0
+	return nil
+}
+
 type plexDiscoverMetadata struct {
 	RatingKey             string               `json:"ratingKey,omitempty"`
 	Key                   string               `json:"key,omitempty"`
@@ -743,7 +763,15 @@ type plexDiscoverMetadata struct {
 	Type                  string               `json:"type,omitempty"`
 	Title                 string               `json:"title,omitempty"`
 	OriginalTitle         string               `json:"originalTitle,omitempty"`
+	Summary               string               `json:"summary,omitempty"`
 	Year                  int                  `json:"year,omitempty"`
+	Index                 int                  `json:"index,omitempty"`
+	ParentIndex           int                  `json:"parentIndex,omitempty"`
+	LeafCount             int                  `json:"leafCount,omitempty"`
+	ChildCount            int                  `json:"childCount,omitempty"`
+	Duration              int                  `json:"duration,omitempty"`
+	Rating                plexDiscoverFloat    `json:"rating,omitempty"`
+	AudienceRating        plexDiscoverFloat    `json:"audienceRating,omitempty"`
 	OriginallyAvailableAt string               `json:"originallyAvailableAt,omitempty"`
 	PublicPagesURL        string               `json:"publicPagesURL,omitempty"`
 	Slug                  string               `json:"slug,omitempty"`
@@ -767,7 +795,11 @@ type plexDiscoverSearchResponse struct {
 
 type plexDiscoverMetadataResponse struct {
 	MediaContainer struct {
-		Metadata []plexDiscoverMetadata `json:"Metadata"`
+		Offset    int                    `json:"offset"`
+		Size      int                    `json:"size"`
+		TotalSize int                    `json:"totalSize"`
+		Metadata  []plexDiscoverMetadata `json:"Metadata"`
+		Directory []plexDiscoverMetadata `json:"Directory"`
 	} `json:"MediaContainer"`
 }
 
@@ -1018,6 +1050,7 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/channels/", s.handleChannels)
 	mux.HandleFunc("/api/v1/discover/trending", s.handleDiscoverList)
 	mux.HandleFunc("/api/v1/discover/popular", s.handleDiscoverList)
+	mux.HandleFunc("/api/v1/tmdb/", s.handleTMDBByID)
 	mux.HandleFunc("/api/v1/artwork/refresh", s.requireAuth(s.handlePlexArtworkRefresh))
 	mux.HandleFunc("/api/v1/artwork/status", s.requireAuth(s.handlePlexArtworkStatus))
 	mux.HandleFunc("/api/v1/artwork/", s.handlePlexArtworkByID)
@@ -3214,6 +3247,422 @@ func (s *appState) handleSeriesByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *appState) handleTMDBByID(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	const prefix = "/api/v1/tmdb/"
+	if !strings.HasPrefix(r.URL.Path, prefix) {
+		respondError(w, http.StatusNotFound, "tmdb endpoint not found")
+		return
+	}
+
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, prefix), "/"), "/")
+	if len(parts) < 2 {
+		respondError(w, http.StatusNotFound, "tmdb metadata not found")
+		return
+	}
+
+	routeMediaType, stremioType, ok := normalizeTMDBRouteMediaType(parts[0])
+	if !ok {
+		respondError(w, http.StatusBadRequest, "unsupported tmdb media type")
+		return
+	}
+
+	rawID, err := url.PathUnescape(parts[1])
+	if err != nil {
+		rawID = parts[1]
+	}
+	tmdbIDText := strings.TrimPrefix(strings.TrimSpace(rawID), "tmdb:")
+	tmdbID, err := strconv.Atoi(tmdbIDText)
+	if err != nil || tmdbID <= 0 {
+		respondError(w, http.StatusBadRequest, "invalid tmdb id")
+		return
+	}
+
+	tail := ""
+	if len(parts) > 2 {
+		tail = strings.Join(parts[2:], "/")
+	}
+
+	meta, manifestErr := s.findManifestMetaByTMDBID(r.Context(), stremioType, tmdbID)
+	if manifestErr == nil {
+		switch tail {
+		case "":
+			respondJSON(w, http.StatusOK, map[string]any{
+				"details": tmdbDetailsFromManifest(meta, routeMediaType, tmdbID),
+			})
+		case "seasons":
+			if routeMediaType != "tv" {
+				respondError(w, http.StatusNotFound, "tmdb seasons not found")
+				return
+			}
+			respondJSON(w, http.StatusOK, map[string]any{
+				"seasons": tmdbSeasonsFromManifest(meta),
+			})
+		case "episodes":
+			if routeMediaType != "tv" {
+				respondError(w, http.StatusNotFound, "tmdb episodes not found")
+				return
+			}
+			respondJSON(w, http.StatusOK, map[string]any{
+				"episodes": manifestEpisodesFromStremio(meta),
+			})
+		default:
+			respondError(w, http.StatusNotFound, "tmdb endpoint not found")
+		}
+		return
+	}
+
+	if routeMediaType == "tv" {
+		switch tail {
+		case "":
+			details, err := s.tmdbTVDetailsFromPlexDiscover(r.Context(), tmdbID)
+			if err != nil {
+				respondError(w, http.StatusNotFound, fmt.Sprintf("%v; %v", manifestErr, err))
+				return
+			}
+			respondJSON(w, http.StatusOK, map[string]any{"details": details})
+		case "seasons":
+			seasons, err := s.tmdbTVSeasonsFromPlexDiscover(r.Context(), tmdbID)
+			if err != nil {
+				respondError(w, http.StatusNotFound, fmt.Sprintf("%v; %v", manifestErr, err))
+				return
+			}
+			respondJSON(w, http.StatusOK, map[string]any{"seasons": seasons})
+		case "episodes":
+			episodes, err := s.tmdbTVEpisodesFromPlexDiscover(r.Context(), tmdbID)
+			if err != nil {
+				respondError(w, http.StatusNotFound, fmt.Sprintf("%v; %v", manifestErr, err))
+				return
+			}
+			respondJSON(w, http.StatusOK, map[string]any{"episodes": episodes})
+		default:
+			respondError(w, http.StatusNotFound, "tmdb endpoint not found")
+		}
+		return
+	}
+
+	respondError(w, http.StatusNotFound, manifestErr.Error())
+}
+
+func normalizeTMDBRouteMediaType(value string) (routeMediaType string, stremioType string, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "movie", "movies":
+		return "movie", "movie", true
+	case "tv", "show", "shows", "series":
+		return "tv", "series", true
+	default:
+		return "", "", false
+	}
+}
+
+func (s *appState) findManifestMetaByTMDBID(ctx context.Context, mediaType string, tmdbID int) (stremioMeta, error) {
+	if tmdbID <= 0 {
+		return stremioMeta{}, fmt.Errorf("missing tmdb id")
+	}
+
+	ids := []string{
+		"tmdb:" + strconv.Itoa(tmdbID),
+		strconv.Itoa(tmdbID),
+	}
+	var lastErr error
+	for _, id := range ids {
+		meta, err := s.findManifestMeta(ctx, mediaType, id)
+		if err == nil {
+			return meta, nil
+		}
+		lastErr = err
+	}
+
+	if lastErr != nil {
+		return stremioMeta{}, fmt.Errorf("manifest metadata not found for tmdb:%d: %w", tmdbID, lastErr)
+	}
+	return stremioMeta{}, fmt.Errorf("manifest metadata not found for tmdb:%d", tmdbID)
+}
+
+func tmdbDetailsFromManifest(meta stremioMeta, mediaType string, fallbackTMDBID int) map[string]any {
+	fallbackType := "movie"
+	if mediaType == "tv" {
+		fallbackType = "series"
+	}
+
+	detail := manifestDetailFromStremio(meta, fallbackType)
+	item := detail.vortexoHomeItem
+	tmdbID := item.TMDBID
+	if tmdbID <= 0 {
+		tmdbID = fallbackTMDBID
+	}
+
+	details := map[string]any{
+		"id":                 tmdbID,
+		"overview":           item.Overview,
+		"poster_path":        item.PosterPath,
+		"backdrop_path":      item.BackdropPath,
+		"poster_paths":       stringList(item.PosterPath),
+		"backdrop_paths":     stringList(item.BackdropPath),
+		"landscape_paths":    stringList(item.LandscapePath),
+		"logo_path":          item.LogoPath,
+		"logo_paths":         stringList(item.LogoPath),
+		"genres":             item.Genres,
+		"vote_average":       item.VoteAverage,
+		"runtime":            item.Runtime,
+		"number_of_seasons":  detail.NumberOfSeasons,
+		"number_of_episodes": detail.NumberOfEpisodes,
+	}
+
+	if mediaType == "tv" {
+		details["name"] = item.Title
+		details["first_air_date"] = item.FirstAirDate
+	} else {
+		details["title"] = item.Title
+		details["release_date"] = item.ReleaseDate
+	}
+
+	return details
+}
+
+func tmdbSeasonsFromManifest(meta stremioMeta) []map[string]any {
+	detail := manifestDetailFromStremio(meta, "series")
+	episodes := manifestEpisodesFromStremio(meta)
+	episodesBySeason := map[int][]vortexoManifestEpisode{}
+	for _, episode := range episodes {
+		episodesBySeason[episode.SeasonNumber] = append(episodesBySeason[episode.SeasonNumber], episode)
+	}
+
+	seasonSet := map[int]bool{}
+	for seasonNumber := range episodesBySeason {
+		seasonSet[seasonNumber] = true
+	}
+	if len(seasonSet) == 0 && detail.NumberOfSeasons > 0 {
+		for seasonNumber := 1; seasonNumber <= detail.NumberOfSeasons; seasonNumber++ {
+			seasonSet[seasonNumber] = true
+		}
+	}
+
+	seasonNumbers := make([]int, 0, len(seasonSet))
+	for seasonNumber := range seasonSet {
+		seasonNumbers = append(seasonNumbers, seasonNumber)
+	}
+	sort.Ints(seasonNumbers)
+
+	seasons := make([]map[string]any, 0, len(seasonNumbers))
+	for _, seasonNumber := range seasonNumbers {
+		seasonEpisodes := episodesBySeason[seasonNumber]
+		airDate := ""
+		for _, episode := range seasonEpisodes {
+			if episode.AirDate != "" {
+				airDate = episode.AirDate
+				break
+			}
+		}
+
+		name := fmt.Sprintf("Season %d", seasonNumber)
+		if seasonNumber == 0 {
+			name = "Specials"
+		}
+
+		seasons = append(seasons, map[string]any{
+			"id":            seasonNumber,
+			"season_number": seasonNumber,
+			"name":          name,
+			"overview":      detail.Overview,
+			"poster_path":   detail.PosterPath,
+			"air_date":      airDate,
+			"episode_count": len(seasonEpisodes),
+		})
+	}
+
+	return seasons
+}
+
+func (s *appState) tmdbTVDetailsFromPlexDiscover(ctx context.Context, tmdbID int) (map[string]any, error) {
+	meta, token, err := s.plexDiscoverTVMetadataForTMDB(ctx, tmdbID)
+	if err != nil {
+		return nil, err
+	}
+	return tmdbDetailsFromPlexDiscover(meta, token, tmdbID), nil
+}
+
+func (s *appState) tmdbTVSeasonsFromPlexDiscover(ctx context.Context, tmdbID int) ([]map[string]any, error) {
+	meta, token, err := s.plexDiscoverTVMetadataForTMDB(ctx, tmdbID)
+	if err != nil {
+		return nil, err
+	}
+	discoverID := plexDiscoverMetadataID(meta)
+	if discoverID == "" {
+		return nil, fmt.Errorf("Plex Discover show id missing")
+	}
+	items, err := s.getSignedPlexDiscoverMetadataList(ctx, token, "/library/metadata/"+discoverID+"/children", 1000)
+	if err != nil {
+		return nil, err
+	}
+	seasons := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		if strings.ToLower(strings.TrimSpace(item.Type)) != "season" {
+			continue
+		}
+		seasons = append(seasons, tmdbSeasonFromPlexDiscover(item, token))
+	}
+	sort.SliceStable(seasons, func(i, j int) bool {
+		return intFromAny(seasons[i]["season_number"]) < intFromAny(seasons[j]["season_number"])
+	})
+	return seasons, nil
+}
+
+func (s *appState) tmdbTVEpisodesFromPlexDiscover(ctx context.Context, tmdbID int) ([]map[string]any, error) {
+	meta, token, err := s.plexDiscoverTVMetadataForTMDB(ctx, tmdbID)
+	if err != nil {
+		return nil, err
+	}
+	discoverID := plexDiscoverMetadataID(meta)
+	if discoverID == "" {
+		return nil, fmt.Errorf("Plex Discover show id missing")
+	}
+	items, err := s.getSignedPlexDiscoverMetadataList(ctx, token, "/library/metadata/"+discoverID+"/grandchildren", 5000)
+	if err != nil {
+		return nil, err
+	}
+	episodes := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		if strings.ToLower(strings.TrimSpace(item.Type)) != "episode" {
+			continue
+		}
+		episodes = append(episodes, tmdbEpisodeFromPlexDiscover(item, token))
+	}
+	sort.SliceStable(episodes, func(i, j int) bool {
+		leftSeason := intFromAny(episodes[i]["season_number"])
+		rightSeason := intFromAny(episodes[j]["season_number"])
+		if leftSeason != rightSeason {
+			return leftSeason < rightSeason
+		}
+		return intFromAny(episodes[i]["episode_number"]) < intFromAny(episodes[j]["episode_number"])
+	})
+	return episodes, nil
+}
+
+func (s *appState) plexDiscoverTVMetadataForTMDB(ctx context.Context, tmdbID int) (plexDiscoverMetadata, string, error) {
+	token := s.plexAccountToken()
+	if token == "" {
+		return plexDiscoverMetadata{}, "", fmt.Errorf("Plex account token is not configured")
+	}
+
+	seed := s.plexDiscoverSeedForTMDBID("tv", tmdbID)
+	if strings.TrimSpace(seed.Title) == "" {
+		return plexDiscoverMetadata{}, "", fmt.Errorf("no watch-state title for tmdb:%d", tmdbID)
+	}
+
+	results, err := s.searchSignedPlexDiscoverMetadata(ctx, token, seed.Title, 12)
+	if err != nil {
+		return plexDiscoverMetadata{}, "", err
+	}
+	match := bestPlexDiscoverSearchMatch(results, seed)
+	if match == nil {
+		return plexDiscoverMetadata{}, "", fmt.Errorf("Plex Discover metadata not found for tmdb:%d", tmdbID)
+	}
+
+	if discoverID := plexDiscoverMetadataID(*match); discoverID != "" {
+		if hydrated, err := s.getSignedPlexDiscoverMetadata(ctx, token, discoverID); err == nil && hydrated != nil {
+			return *hydrated, token, nil
+		}
+	}
+	return *match, token, nil
+}
+
+func (s *appState) plexDiscoverSeedForTMDBID(mediaType string, tmdbID int) plexArtworkSeedItem {
+	seed := plexArtworkSeedItem{
+		MediaType: normalizePlexArtworkMediaType(mediaType),
+		TMDBID:    tmdbID,
+	}
+
+	s.mu.RLock()
+	for _, item := range s.watchState.Items {
+		if item.TMDBID != tmdbID {
+			continue
+		}
+		if seed.Title == "" {
+			seed.Title = firstNonEmpty(item.ParentTitle, item.Title)
+		}
+		if seed.IMDBID == "" {
+			seed.IMDBID = item.IMDBID
+		}
+		if seed.Year == 0 {
+			seed.Year = item.Year
+		}
+		if seed.Title != "" && seed.IMDBID != "" {
+			break
+		}
+	}
+	s.mu.RUnlock()
+
+	if record, ok := s.getCachedPlexArtwork(seed.MediaType, tmdbID, seed.IMDBID, seed.Title, seed.Year); ok {
+		seed.Title = firstNonEmpty(seed.Title, record.Title)
+		seed.IMDBID = firstNonEmpty(seed.IMDBID, record.IMDBID)
+		seed.Year = firstNonZero(seed.Year, record.Year)
+	}
+	return seed
+}
+
+func tmdbDetailsFromPlexDiscover(meta plexDiscoverMetadata, token string, fallbackTMDBID int) map[string]any {
+	artwork := plexArtworkFromDiscoverMetadata(meta, token)
+	tmdbID, _ := plexDiscoverExternalIDs(meta, "tv")
+	if tmdbID <= 0 {
+		tmdbID = fallbackTMDBID
+	}
+	return map[string]any{
+		"id":                 tmdbID,
+		"name":               firstNonEmpty(meta.Title, meta.OriginalTitle),
+		"overview":           meta.Summary,
+		"poster_path":        firstNonEmpty(firstPlexArtworkURL(artwork.Thumbnail), meta.Thumb),
+		"backdrop_path":      firstNonEmpty(firstPlexArtworkURL(artwork.Background), meta.Art),
+		"poster_paths":       uniqueNonEmptyStrings([]string{firstPlexArtworkURL(artwork.Thumbnail), meta.Thumb}),
+		"backdrop_paths":     uniqueNonEmptyStrings([]string{firstPlexArtworkURL(artwork.Background), meta.Art}),
+		"landscape_paths":    uniqueNonEmptyStrings([]string{firstPlexArtworkURL(artwork.Landscape, artwork.CoverArt), meta.Banner}),
+		"logo_path":          firstPlexArtworkURL(artwork.ClearLogo),
+		"logo_paths":         uniqueNonEmptyStrings([]string{firstPlexArtworkURL(artwork.ClearLogo)}),
+		"genres":             []string{},
+		"vote_average":       firstNonZeroFloat(float64(meta.AudienceRating), float64(meta.Rating)),
+		"first_air_date":     meta.OriginallyAvailableAt,
+		"number_of_seasons":  meta.ChildCount,
+		"number_of_episodes": meta.LeafCount,
+	}
+}
+
+func tmdbSeasonFromPlexDiscover(meta plexDiscoverMetadata, token string) map[string]any {
+	artwork := plexArtworkFromDiscoverMetadata(meta, token)
+	seasonNumber := meta.Index
+	return map[string]any{
+		"id":            firstNonZero(meta.Index, intFromAny(meta.RatingKey)),
+		"season_number": seasonNumber,
+		"name":          firstNonEmpty(meta.Title, fmt.Sprintf("Season %d", seasonNumber)),
+		"overview":      meta.Summary,
+		"poster_path":   firstNonEmpty(firstPlexArtworkURL(artwork.Thumbnail), meta.Thumb),
+		"air_date":      meta.OriginallyAvailableAt,
+		"episode_count": meta.LeafCount,
+	}
+}
+
+func tmdbEpisodeFromPlexDiscover(meta plexDiscoverMetadata, token string) map[string]any {
+	artwork := plexArtworkFromDiscoverMetadata(meta, token)
+	runtimeMinutes := 0
+	if meta.Duration > 0 {
+		runtimeMinutes = meta.Duration / 60000
+	}
+	return map[string]any{
+		"id":             firstNonEmpty(meta.RatingKey, meta.Key, meta.GUID),
+		"title":          firstNonEmpty(meta.Title, fmt.Sprintf("Episode %d", meta.Index)),
+		"overview":       meta.Summary,
+		"still_path":     firstNonEmpty(firstPlexArtworkURL(artwork.Landscape, artwork.CoverArt, artwork.Thumbnail), meta.Thumb, meta.Art),
+		"season_number":  meta.ParentIndex,
+		"episode_number": meta.Index,
+		"runtime":        runtimeMinutes,
+		"air_date":       meta.OriginallyAvailableAt,
+		"vote_average":   firstNonZeroFloat(float64(meta.AudienceRating), float64(meta.Rating)),
+	}
+}
+
 func (s *appState) handleXtreamPlayerAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -5358,6 +5807,66 @@ func (s *appState) getSignedPlexDiscoverMetadata(ctx context.Context, token stri
 	return &response.MediaContainer.Metadata[0], nil
 }
 
+func (s *appState) getSignedPlexDiscoverMetadataList(ctx context.Context, token string, rawPath string, limit int) ([]plexDiscoverMetadata, error) {
+	rawPath = "/" + strings.TrimLeft(strings.TrimSpace(rawPath), "/")
+	if rawPath == "/" {
+		return nil, fmt.Errorf("missing Discover metadata path")
+	}
+	if limit <= 0 {
+		limit = 5000
+	}
+
+	pageSize := minInt(limit, 100)
+	itemsOut := make([]plexDiscoverMetadata, 0, minInt(limit, 256))
+	for offset := 0; len(itemsOut) < limit; offset += pageSize {
+		components, err := url.Parse("https://discover.provider.plex.tv" + rawPath)
+		if err != nil {
+			return nil, err
+		}
+		items := s.plexDiscoverQueryItems(token)
+		items = append(items,
+			plexQueryItem{Name: "includeMeta", Value: "1"},
+			plexQueryItem{Name: "includeExternalMetadata", Value: "1"},
+			plexQueryItem{Name: "includeGuids", Value: "1"},
+			plexQueryItem{Name: "includeImages", Value: "1"},
+			plexQueryItem{Name: "includeExternalMedia", Value: "1"},
+			plexQueryItem{Name: "X-Plex-Container-Start", Value: strconv.Itoa(offset)},
+			plexQueryItem{Name: "X-Plex-Container-Size", Value: strconv.Itoa(pageSize)},
+		)
+		values := url.Values{}
+		for _, item := range items {
+			values.Add(item.Name, item.Value)
+		}
+		components.RawQuery = values.Encode()
+
+		var response plexDiscoverMetadataResponse
+		if err := s.plexJSON(ctx, http.MethodGet, components.String(), nil, s.plexDiscoverHeaders(token), &response); err != nil {
+			return nil, err
+		}
+
+		pageItems := make([]plexDiscoverMetadata, 0, len(response.MediaContainer.Directory)+len(response.MediaContainer.Metadata))
+		pageItems = append(pageItems, response.MediaContainer.Directory...)
+		pageItems = append(pageItems, response.MediaContainer.Metadata...)
+		if len(pageItems) == 0 {
+			break
+		}
+		remaining := limit - len(itemsOut)
+		if len(pageItems) > remaining {
+			pageItems = pageItems[:remaining]
+		}
+		itemsOut = append(itemsOut, pageItems...)
+
+		totalSize := response.MediaContainer.TotalSize
+		if totalSize > 0 && len(itemsOut) >= totalSize {
+			break
+		}
+		if len(pageItems) < pageSize {
+			break
+		}
+	}
+	return itemsOut, nil
+}
+
 func (s *appState) fetchPlexArtworkPage(ctx context.Context, pageURL string, delay time.Duration) (string, error) {
 	if err := s.waitForPlexArtworkSlot(ctx, delay); err != nil {
 		return "", err
@@ -5472,10 +5981,10 @@ func (s *appState) applyCachedPlexArtworkToWatchStateItem(item *watchStateItem) 
 		item.LandscapePath = landscape
 	}
 	if background := firstPlexArtworkURL(record.Artwork.Background); background != "" {
-		item.BackdropPath = firstNonEmpty(item.BackdropPath, background)
+		item.BackdropPath = background
 	}
 	if logo := firstPlexArtworkURL(record.Artwork.ClearLogo); logo != "" {
-		item.LogoPath = firstNonEmpty(item.LogoPath, logo)
+		item.LogoPath = logo
 	}
 	if item.PosterPath == "" {
 		item.PosterPath = firstPlexArtworkURL(record.Artwork.Thumbnail)
@@ -7356,6 +7865,15 @@ func firstNonZero(values ...int) int {
 }
 
 func firstNonZero64(values ...int64) int64 {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func firstNonZeroFloat(values ...float64) float64 {
 	for _, value := range values {
 		if value != 0 {
 			return value
