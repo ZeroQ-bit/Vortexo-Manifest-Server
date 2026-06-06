@@ -6,6 +6,54 @@ import (
 	"time"
 )
 
+func TestSelectYouTubePlaybackURLPrefersMuxedAudioVideo(t *testing.T) {
+	var response youtubePlayerResponse
+	response.StreamingData.AdaptiveFormats = []youtubeFormat{
+		{
+			URL:      "https://example.test/video-only-1080",
+			MimeType: "video/mp4; codecs=\"avc1.640028\"",
+			Height:   1080,
+			Bitrate:  5000000,
+		},
+	}
+	response.StreamingData.Formats = []youtubeFormat{
+		{
+			URL:          "https://example.test/muxed-360",
+			MimeType:     "video/mp4; codecs=\"avc1.42001E, mp4a.40.2\"",
+			Height:       360,
+			Bitrate:      600000,
+			AudioQuality: "AUDIO_QUALITY_MEDIUM",
+		},
+	}
+
+	playbackURL, container, err := selectYouTubePlaybackURL(response)
+	if err != nil {
+		t.Fatalf("expected muxed stream, got error: %v", err)
+	}
+	if playbackURL != "https://example.test/muxed-360" {
+		t.Fatalf("expected muxed stream, got %q", playbackURL)
+	}
+	if container != "mp4" {
+		t.Fatalf("expected mp4 container, got %q", container)
+	}
+}
+
+func TestSelectYouTubePlaybackURLRejectsVideoOnlyDirectFormats(t *testing.T) {
+	var response youtubePlayerResponse
+	response.StreamingData.AdaptiveFormats = []youtubeFormat{
+		{
+			URL:      "https://example.test/video-only-1080",
+			MimeType: "video/mp4; codecs=\"avc1.640028\"",
+			Height:   1080,
+			Bitrate:  5000000,
+		},
+	}
+
+	if _, _, err := selectYouTubePlaybackURL(response); err == nil {
+		t.Fatal("expected video-only formats to be rejected")
+	}
+}
+
 func TestStructuredPlexArtworkKeepsLandscapeTileSeparateFromBackground(t *testing.T) {
 	html := `
 		<script>

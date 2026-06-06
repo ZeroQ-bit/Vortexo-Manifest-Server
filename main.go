@@ -903,12 +903,13 @@ type youtubePlayerResponse struct {
 }
 
 type youtubeFormat struct {
-	URL          string `json:"url"`
-	MimeType     string `json:"mimeType"`
-	QualityLabel string `json:"qualityLabel"`
-	Height       int    `json:"height"`
-	Bitrate      int    `json:"bitrate"`
-	AudioQuality string `json:"audioQuality"`
+	URL           string `json:"url"`
+	MimeType      string `json:"mimeType"`
+	QualityLabel  string `json:"qualityLabel"`
+	Height        int    `json:"height"`
+	Bitrate       int    `json:"bitrate"`
+	AudioQuality  string `json:"audioQuality"`
+	AudioChannels int    `json:"audioChannels"`
 }
 
 type traktDeviceCodeResponse struct {
@@ -8261,6 +8262,28 @@ func selectYouTubePlaybackURL(response youtubePlayerResponse) (string, string, e
 
 	formats := append([]youtubeFormat{}, response.StreamingData.Formats...)
 	formats = append(formats, response.StreamingData.AdaptiveFormats...)
+	playableFormats := make([]youtubeFormat, 0, len(formats))
+	for _, format := range formats {
+		if strings.TrimSpace(format.URL) == "" {
+			continue
+		}
+		lowerMime := strings.ToLower(format.MimeType)
+		if !strings.Contains(lowerMime, "video/") {
+			continue
+		}
+		if !strings.Contains(lowerMime, "mp4") {
+			continue
+		}
+		if !youtubeFormatHasAudio(format) {
+			continue
+		}
+		playableFormats = append(playableFormats, format)
+	}
+	if len(playableFormats) == 0 {
+		return "", "", fmt.Errorf("no direct trailer stream with audio")
+	}
+
+	formats = playableFormats
 	sort.SliceStable(formats, func(i, j int) bool {
 		left := youtubeFormatScore(formats[i])
 		right := youtubeFormatScore(formats[j])
@@ -8270,12 +8293,6 @@ func selectYouTubePlaybackURL(response youtubePlayerResponse) (string, string, e
 		return formats[i].Bitrate > formats[j].Bitrate
 	})
 	for _, format := range formats {
-		if strings.TrimSpace(format.URL) == "" {
-			continue
-		}
-		if !strings.Contains(strings.ToLower(format.MimeType), "video/") {
-			continue
-		}
 		return strings.TrimSpace(format.URL), youtubeContainerForFormat(format), nil
 	}
 	return "", "", fmt.Errorf("no direct trailer stream")
@@ -8283,13 +8300,25 @@ func selectYouTubePlaybackURL(response youtubePlayerResponse) (string, string, e
 
 func youtubeFormatScore(format youtubeFormat) int {
 	score := format.Height * 1000
-	if strings.Contains(strings.ToLower(format.MimeType), "mp4") {
-		score += 500
+	lowerMime := strings.ToLower(format.MimeType)
+	if strings.Contains(lowerMime, "mp4") {
+		score += 5000
 	}
-	if strings.TrimSpace(format.AudioQuality) != "" || strings.Contains(strings.ToLower(format.MimeType), "mp4a") {
-		score += 250
+	if youtubeFormatHasAudio(format) {
+		score += 1000000
+	}
+	if strings.Contains(lowerMime, "mp4a") {
+		score += 1000
 	}
 	return score + format.Bitrate/10000
+}
+
+func youtubeFormatHasAudio(format youtubeFormat) bool {
+	lowerMime := strings.ToLower(format.MimeType)
+	return strings.TrimSpace(format.AudioQuality) != "" ||
+		strings.Contains(lowerMime, "mp4a") ||
+		strings.Contains(lowerMime, "opus") ||
+		format.AudioChannels > 0
 }
 
 func youtubeContainerForFormat(format youtubeFormat) string {
