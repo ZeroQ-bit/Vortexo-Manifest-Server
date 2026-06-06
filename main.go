@@ -3654,7 +3654,7 @@ func tmdbEpisodeFromPlexDiscover(meta plexDiscoverMetadata, token string) map[st
 		"id":             firstNonEmpty(meta.RatingKey, meta.Key, meta.GUID),
 		"title":          firstNonEmpty(meta.Title, fmt.Sprintf("Episode %d", meta.Index)),
 		"overview":       meta.Summary,
-		"still_path":     firstNonEmpty(firstPlexArtworkURL(artwork.Landscape, artwork.CoverArt, artwork.Thumbnail), meta.Thumb, meta.Art),
+		"still_path":     firstNonEmpty(meta.Thumb, firstPlexArtworkURL(artwork.Thumbnail), firstPlexArtworkURL(artwork.Landscape, artwork.CoverArt), meta.Art),
 		"season_number":  meta.ParentIndex,
 		"episode_number": meta.Index,
 		"runtime":        runtimeMinutes,
