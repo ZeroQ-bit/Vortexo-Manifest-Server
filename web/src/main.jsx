@@ -56,6 +56,11 @@ const STREAMING_CATALOG_TYPES = [
   ["movie", "Movies"],
   ["series", "Shows"],
 ];
+const STREAMING_CATALOG_SORTS = [
+  ["TRENDING", "Trending"],
+  ["POPULAR", "Popular"],
+  ["NEW", "New"],
+];
 
 const NAV = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
@@ -118,6 +123,8 @@ function App() {
   const [streamingCatalogs, setStreamingCatalogs] = useState({
     providers: ["nfx", "dnp", "amp", "atp", "hbm"],
     types: ["movie", "series"],
+    mergeProviders: false,
+    sortBy: "TRENDING",
     rpdbKey: "",
   });
   const [watchForm, setWatchForm] = useState({
@@ -507,6 +514,8 @@ function App() {
           install: true,
           providers: streamingCatalogs.providers,
           types: streamingCatalogs.types,
+          merge_providers: streamingCatalogs.mergeProviders,
+          sort_by: streamingCatalogs.sortBy,
           rpdb_key: streamingCatalogs.rpdbKey.trim(),
         }),
       });
@@ -1274,6 +1283,30 @@ function Setup({ perfect, setPerfect, streamingCatalogs, setStreamingCatalogs, o
               ))}
             </div>
           </div>
+          <div className="choice-block">
+            <span>Layout</span>
+            <div className="choice-grid single-choice-grid">
+              <label className={streamingCatalogs.mergeProviders ? "choice-chip selected" : "choice-chip"}>
+                <input
+                  type="checkbox"
+                  checked={streamingCatalogs.mergeProviders}
+                  onChange={() => setStreamingCatalogs({
+                    ...streamingCatalogs,
+                    mergeProviders: !streamingCatalogs.mergeProviders,
+                  })}
+                />
+                Merge providers
+              </label>
+            </div>
+          </div>
+        </div>
+        <div className="form-grid two">
+          <SelectField
+            label="Sort by"
+            value={streamingCatalogs.sortBy}
+            onChange={(value) => setStreamingCatalogs({ ...streamingCatalogs, sortBy: value })}
+            options={STREAMING_CATALOG_SORTS}
+          />
           <TextField
             label="RPDB key"
             value={streamingCatalogs.rpdbKey}

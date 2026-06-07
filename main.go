@@ -35,6 +35,7 @@ const (
 	streamingCatalogAddonPath       = "/addons/streaming-catalogs"
 	streamingCatalogCacheTTL        = 6 * time.Hour
 	streamingCatalogJustWatchLimit  = 100
+	streamingCatalogNewLookbackDays = 30
 	streamingCatalogJustWatchURL    = "https://apis.justwatch.com/graphql"
 	plexProduct                     = "Vortexo Manifest Server"
 	plexVersion                     = "1.0.0"
@@ -127,10 +128,12 @@ type installedManifest struct {
 }
 
 type streamingCatalogSetupRequest struct {
-	Install   bool     `json:"install"`
-	Providers []string `json:"providers"`
-	Types     []string `json:"types"`
-	RPDBKey   string   `json:"rpdb_key,omitempty"`
+	Install        bool     `json:"install"`
+	Providers      []string `json:"providers"`
+	Types          []string `json:"types"`
+	MergeProviders bool     `json:"merge_providers,omitempty"`
+	SortBy         string   `json:"sort_by,omitempty"`
+	RPDBKey        string   `json:"rpdb_key,omitempty"`
 }
 
 type streamingCatalogSetupResponse struct {
@@ -140,9 +143,11 @@ type streamingCatalogSetupResponse struct {
 }
 
 type streamingCatalogAddonConfig struct {
-	Providers []string `json:"providers"`
-	Types     []string `json:"types"`
-	RPDBKey   string   `json:"rpdb_key,omitempty"`
+	Providers      []string `json:"providers"`
+	Types          []string `json:"types"`
+	MergeProviders bool     `json:"merge_providers,omitempty"`
+	SortBy         string   `json:"sort_by,omitempty"`
+	RPDBKey        string   `json:"rpdb_key,omitempty"`
 }
 
 type streamingCatalogProvider struct {
@@ -359,6 +364,7 @@ type justWatchPopularTitlesResponse struct {
 					Content struct {
 						Title       string `json:"title"`
 						PosterURL   string `json:"posterUrl"`
+						ReleaseYear int    `json:"originalReleaseYear"`
 						ExternalIDs struct {
 							IMDBID string `json:"imdbId"`
 						} `json:"externalIds"`
@@ -372,8 +378,41 @@ type justWatchPopularTitlesResponse struct {
 	} `json:"data"`
 }
 
+type justWatchNewTitlesResponse struct {
+	Data struct {
+		NewTitles struct {
+			Edges []struct {
+				Node struct {
+					TypeName   string                   `json:"__typename"`
+					ObjectType string                   `json:"objectType"`
+					Content    justWatchNewTitleContent `json:"content"`
+					Show       struct {
+						ObjectType string                   `json:"objectType"`
+						Content    justWatchNewTitleContent `json:"content"`
+					} `json:"show"`
+				} `json:"node"`
+			} `json:"edges"`
+		} `json:"newTitles"`
+	} `json:"data"`
+}
+
+type justWatchNewTitleContent struct {
+	Title        string `json:"title"`
+	PosterURL    string `json:"posterUrl"`
+	ReleaseYear  int    `json:"originalReleaseYear"`
+	SeasonNumber int    `json:"seasonNumber"`
+	ExternalIDs  struct {
+		IMDBID string `json:"imdbId"`
+	} `json:"externalIds"`
+	Scoring struct {
+		IMDBScore any `json:"imdbScore"`
+	} `json:"scoring"`
+}
+
 var streamingCatalogDefaultProviders = []string{"nfx", "dnp", "amp", "atp", "hbm"}
 var streamingCatalogDefaultTypes = []string{"movie", "series"}
+var streamingCatalogDefaultSortBy = "TRENDING"
+var streamingCatalogMergedID = "merged"
 var streamingCatalogProviderOrder = []string{
 	"nfx", "nfk", "dnp", "amp", "atp", "hbm", "pmp", "hlu", "pcp", "cru",
 	"jhs", "zee", "vil", "nlz", "sst", "clv", "gop", "hay", "mgl", "cts",
@@ -2433,6 +2472,8 @@ func (s *appState) handleStreamingCatalogsSetup(w http.ResponseWriter, r *http.R
 			"providers":         streamingCatalogDashboardProviders(),
 			"default_providers": streamingCatalogDefaultProviders,
 			"default_types":     streamingCatalogDefaultTypes,
+			"default_sort_by":   streamingCatalogDefaultSortBy,
+			"sort_options":      streamingCatalogSortOptions(),
 		})
 	case http.MethodPost:
 		var req streamingCatalogSetupRequest
@@ -2441,9 +2482,11 @@ func (s *appState) handleStreamingCatalogsSetup(w http.ResponseWriter, r *http.R
 			return
 		}
 		config := normalizeStreamingCatalogConfig(streamingCatalogAddonConfig{
-			Providers: req.Providers,
-			Types:     req.Types,
-			RPDBKey:   req.RPDBKey,
+			Providers:      req.Providers,
+			Types:          req.Types,
+			MergeProviders: req.MergeProviders,
+			SortBy:         req.SortBy,
+			RPDBKey:        req.RPDBKey,
 		})
 		manifestURL := streamingCatalogManifestURL(requestPublicBaseURL(r), config)
 		response := streamingCatalogSetupResponse{
@@ -2520,7 +2563,7 @@ func (s *appState) handleStreamingCatalogsCatalog(w http.ResponseWriter, r *http
 		respondJSON(w, http.StatusOK, map[string]any{"metas": []stremioMeta{}})
 		return
 	}
-	items, err := s.streamingCatalogMetas(r.Context(), catalogType, providerID)
+	items, err := s.streamingCatalogCatalogMetas(r.Context(), config, catalogType, providerID)
 	if err != nil {
 		log.Printf("streaming catalog %s/%s failed: %v", catalogType, providerID, err)
 		respondJSON(w, http.StatusOK, map[string]any{"metas": []stremioMeta{}})
@@ -2545,6 +2588,14 @@ func streamingCatalogDashboardProviders() []map[string]any {
 	return providers
 }
 
+func streamingCatalogSortOptions() []map[string]string {
+	return []map[string]string{
+		{"id": "TRENDING", "name": "Trending"},
+		{"id": "POPULAR", "name": "Popular"},
+		{"id": "NEW", "name": "New"},
+	}
+}
+
 func streamingCatalogManifest(config streamingCatalogAddonConfig) stremioManifest {
 	config = normalizeStreamingCatalogConfig(config)
 	return stremioManifest{
@@ -2564,6 +2615,21 @@ func streamingCatalogManifest(config streamingCatalogAddonConfig) stremioManifes
 
 func streamingCatalogRows(config streamingCatalogAddonConfig) []stremioCatalog {
 	config = normalizeStreamingCatalogConfig(config)
+	if config.MergeProviders {
+		rows := make([]stremioCatalog, 0, len(config.Types))
+		for _, catalogType := range config.Types {
+			if !streamingCatalogHasProviderForType(config, catalogType) {
+				continue
+			}
+			rows = append(rows, stremioCatalog{
+				ID:   streamingCatalogMergedID,
+				Type: catalogType,
+				Name: streamingCatalogMergedName(catalogType),
+			})
+		}
+		return rows
+	}
+
 	typeSet := map[string]bool{}
 	for _, catalogType := range config.Types {
 		typeSet[catalogType] = true
@@ -2590,7 +2656,14 @@ func streamingCatalogRows(config streamingCatalogAddonConfig) []stremioCatalog {
 
 func streamingCatalogConfigIncludes(config streamingCatalogAddonConfig, catalogType string, providerID string) bool {
 	config = normalizeStreamingCatalogConfig(config)
+	catalogType = normalizeStremioType(catalogType)
 	providerID = canonicalStreamingProviderID(providerID)
+	if providerID == streamingCatalogMergedID {
+		return config.MergeProviders && streamingCatalogHasProviderForType(config, catalogType)
+	}
+	if config.MergeProviders {
+		return false
+	}
 	provider, ok := streamingCatalogProviders[providerID]
 	if !ok || !streamingProviderSupportsType(provider, catalogType) {
 		return false
@@ -2613,9 +2686,44 @@ func streamingCatalogConfigIncludes(config streamingCatalogAddonConfig, catalogT
 	return false
 }
 
+func streamingCatalogHasProviderForType(config streamingCatalogAddonConfig, catalogType string) bool {
+	catalogType = normalizeStremioType(catalogType)
+	if catalogType == "" {
+		return false
+	}
+	typeEnabled := false
+	for _, enabledType := range config.Types {
+		if enabledType == catalogType {
+			typeEnabled = true
+			break
+		}
+	}
+	if !typeEnabled {
+		return false
+	}
+	for _, providerID := range config.Providers {
+		provider, ok := streamingCatalogProviders[providerID]
+		if ok && streamingProviderSupportsType(provider, catalogType) {
+			return true
+		}
+	}
+	return false
+}
+
+func streamingCatalogMergedName(catalogType string) string {
+	if catalogType == "movie" {
+		return "Streaming Movies"
+	}
+	if catalogType == "series" {
+		return "Streaming Shows"
+	}
+	return "Streaming Catalogs"
+}
+
 func normalizeStreamingCatalogConfig(config streamingCatalogAddonConfig) streamingCatalogAddonConfig {
 	config.Providers = normalizeStreamingCatalogProviders(config.Providers)
 	config.Types = normalizeStreamingCatalogTypes(config.Types)
+	config.SortBy = normalizeStreamingCatalogSortBy(config.SortBy)
 	config.RPDBKey = strings.TrimSpace(config.RPDBKey)
 	return config
 }
@@ -2624,6 +2732,7 @@ func defaultStreamingCatalogConfig() streamingCatalogAddonConfig {
 	return normalizeStreamingCatalogConfig(streamingCatalogAddonConfig{
 		Providers: append([]string(nil), streamingCatalogDefaultProviders...),
 		Types:     append([]string(nil), streamingCatalogDefaultTypes...),
+		SortBy:    streamingCatalogDefaultSortBy,
 	})
 }
 
@@ -2674,6 +2783,19 @@ func canonicalStreamingProviderID(providerID string) string {
 		return "jhs"
 	default:
 		return strings.ToLower(strings.TrimSpace(providerID))
+	}
+}
+
+func normalizeStreamingCatalogSortBy(sortBy string) string {
+	switch strings.ToUpper(strings.TrimSpace(sortBy)) {
+	case "NEW":
+		return "NEW"
+	case "POPULAR":
+		return "POPULAR"
+	case "TRENDING", "":
+		return "TRENDING"
+	default:
+		return streamingCatalogDefaultSortBy
 	}
 }
 
@@ -2736,15 +2858,103 @@ func firstForwardedValue(value string) string {
 	return strings.TrimSpace(value)
 }
 
-func (s *appState) streamingCatalogMetas(ctx context.Context, catalogType string, providerID string) ([]stremioMeta, error) {
+func (s *appState) streamingCatalogCatalogMetas(ctx context.Context, config streamingCatalogAddonConfig, catalogType string, catalogID string) ([]stremioMeta, error) {
+	config = normalizeStreamingCatalogConfig(config)
+	catalogID = canonicalStreamingProviderID(catalogID)
+	if catalogID == streamingCatalogMergedID {
+		return s.mergedStreamingCatalogMetas(ctx, config, catalogType)
+	}
+	return s.streamingCatalogMetas(ctx, catalogType, catalogID, config.SortBy)
+}
+
+func (s *appState) mergedStreamingCatalogMetas(ctx context.Context, config streamingCatalogAddonConfig, catalogType string) ([]stremioMeta, error) {
+	type providerCatalogItems struct {
+		providerID string
+		items      []stremioMeta
+	}
+
+	providerItems := make([]providerCatalogItems, 0, len(config.Providers))
+	maxItems := 0
+	for _, providerID := range config.Providers {
+		provider, ok := streamingCatalogProviders[providerID]
+		if !ok || !streamingProviderSupportsType(provider, catalogType) {
+			continue
+		}
+		items, err := s.streamingCatalogMetas(ctx, catalogType, providerID, config.SortBy)
+		if err != nil {
+			log.Printf("streaming catalog %s/%s merge source failed: %v", catalogType, providerID, err)
+			continue
+		}
+		if len(items) == 0 {
+			continue
+		}
+		providerItems = append(providerItems, providerCatalogItems{providerID: providerID, items: items})
+		if len(items) > maxItems {
+			maxItems = len(items)
+		}
+	}
+
+	if len(providerItems) == 0 {
+		return []stremioMeta{}, nil
+	}
+
+	seen := map[string]bool{}
+	if config.SortBy == "NEW" {
+		merged := make([]stremioMeta, 0, streamingCatalogJustWatchLimit)
+		for _, provider := range providerItems {
+			for _, item := range provider.items {
+				key := imdbFromID(firstNonEmpty(item.IMDBID, item.ID))
+				if key == "" {
+					key = strings.ToLower(strings.TrimSpace(item.Type + ":" + item.Name))
+				}
+				if key == "" || seen[key] {
+					continue
+				}
+				seen[key] = true
+				merged = append(merged, item)
+			}
+		}
+		sortStreamingCatalogMetasByNewDate(merged)
+		if len(merged) > streamingCatalogJustWatchLimit {
+			merged = merged[:streamingCatalogJustWatchLimit]
+		}
+		return merged, nil
+	}
+
+	merged := make([]stremioMeta, 0, streamingCatalogJustWatchLimit)
+	for index := 0; index < maxItems && len(merged) < streamingCatalogJustWatchLimit; index++ {
+		for _, provider := range providerItems {
+			if index >= len(provider.items) {
+				continue
+			}
+			item := provider.items[index]
+			key := imdbFromID(firstNonEmpty(item.IMDBID, item.ID))
+			if key == "" {
+				key = strings.ToLower(strings.TrimSpace(item.Type + ":" + item.Name))
+			}
+			if key == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			merged = append(merged, item)
+			if len(merged) >= streamingCatalogJustWatchLimit {
+				break
+			}
+		}
+	}
+	return merged, nil
+}
+
+func (s *appState) streamingCatalogMetas(ctx context.Context, catalogType string, providerID string, sortBy string) ([]stremioMeta, error) {
 	providerID = canonicalStreamingProviderID(providerID)
+	sortBy = normalizeStreamingCatalogSortBy(sortBy)
 	provider, ok := streamingCatalogProviders[providerID]
 	if !ok || !streamingProviderSupportsType(provider, catalogType) {
 		return nil, fmt.Errorf("unsupported streaming catalog %s/%s", catalogType, providerID)
 	}
 	country := firstNonEmpty(provider.Countries[catalogType], "US")
 	language := firstNonEmpty(provider.Languages[catalogType], "en")
-	cacheKey := strings.Join([]string{catalogType, providerID, country, language}, ":")
+	cacheKey := strings.Join([]string{catalogType, providerID, country, language, sortBy}, ":")
 	now := time.Now()
 
 	s.streamingCatalogMu.RLock()
@@ -2754,7 +2964,7 @@ func (s *appState) streamingCatalogMetas(ctx context.Context, catalogType string
 		return append([]stremioMeta(nil), cached.items...), nil
 	}
 
-	items, err := s.fetchJustWatchStreamingCatalog(ctx, provider, catalogType, country, language)
+	items, err := s.fetchJustWatchStreamingCatalog(ctx, provider, catalogType, country, language, sortBy)
 	if err != nil {
 		return nil, err
 	}
@@ -2767,7 +2977,12 @@ func (s *appState) streamingCatalogMetas(ctx context.Context, catalogType string
 	return items, nil
 }
 
-func (s *appState) fetchJustWatchStreamingCatalog(ctx context.Context, provider streamingCatalogProvider, catalogType string, country string, language string) ([]stremioMeta, error) {
+func (s *appState) fetchJustWatchStreamingCatalog(ctx context.Context, provider streamingCatalogProvider, catalogType string, country string, language string, sortBy string) ([]stremioMeta, error) {
+	sortBy = normalizeStreamingCatalogSortBy(sortBy)
+	if sortBy == "NEW" {
+		return s.fetchJustWatchNewStreamingCatalog(ctx, provider, catalogType, country, language)
+	}
+
 	objectType := "MOVIE"
 	if catalogType == "series" {
 		objectType = "SHOW"
@@ -2775,7 +2990,7 @@ func (s *appState) fetchJustWatchStreamingCatalog(ctx context.Context, provider 
 	payload := map[string]any{
 		"operationName": "GetPopularTitles",
 		"variables": map[string]any{
-			"popularTitlesSortBy": "TRENDING",
+			"popularTitlesSortBy": sortBy,
 			"first":               streamingCatalogJustWatchLimit,
 			"platform":            "WEB",
 			"sortRandomSeed":      0,
@@ -2819,6 +3034,8 @@ func (s *appState) fetchJustWatchStreamingCatalog(ctx context.Context, provider 
 			Type:        catalogType,
 			Name:        title,
 			Title:       title,
+			Year:        content.ReleaseYear,
+			ReleaseInfo: streamingCatalogReleaseInfo(content.ReleaseYear),
 			IMDBID:      imdbID,
 			Poster:      justWatchStreamingPosterURL(content.PosterURL, imdbID),
 			PosterShape: "poster",
@@ -2826,6 +3043,138 @@ func (s *appState) fetchJustWatchStreamingCatalog(ctx context.Context, provider 
 		})
 	}
 	return items, nil
+}
+
+func (s *appState) fetchJustWatchNewStreamingCatalog(ctx context.Context, provider streamingCatalogProvider, catalogType string, country string, language string) ([]stremioMeta, error) {
+	seen := map[string]bool{}
+	items := make([]stremioMeta, 0, streamingCatalogJustWatchLimit)
+	var firstErr error
+
+	for day := 0; day < streamingCatalogNewLookbackDays && len(items) < streamingCatalogJustWatchLimit; day++ {
+		date := time.Now().UTC().AddDate(0, 0, -day).Format("2006-01-02")
+		dayItems, err := s.fetchJustWatchNewStreamingCatalogDate(ctx, provider, catalogType, country, language, date)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			log.Printf("streaming catalog new titles %s/%s %s failed: %v", catalogType, provider.ID, date, err)
+			continue
+		}
+		for _, item := range dayItems {
+			key := imdbFromID(firstNonEmpty(item.IMDBID, item.ID))
+			if key == "" {
+				key = strings.ToLower(strings.TrimSpace(item.Type + ":" + item.Name))
+			}
+			if key == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			items = append(items, item)
+			if len(items) >= streamingCatalogJustWatchLimit {
+				break
+			}
+		}
+	}
+
+	if len(items) == 0 && firstErr != nil {
+		return nil, firstErr
+	}
+	return items, nil
+}
+
+func (s *appState) fetchJustWatchNewStreamingCatalogDate(ctx context.Context, provider streamingCatalogProvider, catalogType string, country string, language string, date string) ([]stremioMeta, error) {
+	objectType := "MOVIE"
+	if catalogType == "series" {
+		objectType = "SHOW_SEASON"
+	}
+	payload := map[string]any{
+		"operationName": "GetNewTitles",
+		"variables": map[string]any{
+			"country":    country,
+			"date":       date,
+			"first":      streamingCatalogJustWatchLimit,
+			"language":   language,
+			"priceDrops": false,
+			"pageType":   "NEW",
+			"bucketType": "TODAY",
+			"filter": map[string]any{
+				"ageCertifications":          []string{},
+				"excludeGenres":              []string{},
+				"excludeProductionCountries": []string{},
+				"genres":                     []string{},
+				"objectTypes":                []string{objectType},
+				"productionCountries":        []string{},
+				"packages":                   []string{provider.ID},
+				"excludeIrrelevantTitles":    false,
+				"presentationTypes":          []string{},
+				"monetizationTypes":          []string{},
+			},
+		},
+		"query": streamingCatalogJustWatchNewTitlesQuery,
+	}
+
+	var response justWatchNewTitlesResponse
+	if err := s.postJSON(ctx, streamingCatalogJustWatchURL, payload, &response); err != nil {
+		return nil, err
+	}
+
+	items := make([]stremioMeta, 0, len(response.Data.NewTitles.Edges))
+	for _, edge := range response.Data.NewTitles.Edges {
+		content := edge.Node.Content
+		if catalogType == "series" {
+			content = edge.Node.Show.Content
+		}
+		item := streamingCatalogMetaFromNewContent(content, catalogType, date)
+		if item.ID == "" {
+			continue
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+func streamingCatalogMetaFromNewContent(content justWatchNewTitleContent, catalogType string, date string) stremioMeta {
+	imdbID := imdbFromID(content.ExternalIDs.IMDBID)
+	title := strings.TrimSpace(content.Title)
+	if imdbID == "" || title == "" {
+		return stremioMeta{}
+	}
+	return stremioMeta{
+		ID:          imdbID,
+		Type:        catalogType,
+		Name:        title,
+		Title:       title,
+		Year:        content.ReleaseYear,
+		ReleaseInfo: streamingCatalogReleaseInfo(content.ReleaseYear),
+		Released:    date,
+		IMDBID:      imdbID,
+		Poster:      justWatchStreamingPosterURL(content.PosterURL, imdbID),
+		PosterShape: "poster",
+		IMDBRating:  justWatchScoreText(content.Scoring.IMDBScore),
+	}
+}
+
+func streamingCatalogReleaseInfo(year int) string {
+	if year <= 0 {
+		return ""
+	}
+	return strconv.Itoa(year)
+}
+
+func sortStreamingCatalogMetasByNewDate(items []stremioMeta) {
+	sort.SliceStable(items, func(i, j int) bool {
+		leftDate := strings.TrimSpace(items[i].Released)
+		rightDate := strings.TrimSpace(items[j].Released)
+		if leftDate != rightDate {
+			return leftDate > rightDate
+		}
+		left := intFromAny(items[i].Year)
+		right := intFromAny(items[j].Year)
+		if left != right {
+			return left > right
+		}
+		return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name)
+	})
 }
 
 func justWatchStreamingPosterURL(raw string, imdbID string) string {
@@ -2908,7 +3257,7 @@ func (s *appState) localStreamingCatalogValue(ctx context.Context, path string) 
 		if !streamingCatalogConfigIncludes(config, catalogType, providerID) {
 			return map[string]any{"metas": []stremioMeta{}}, nil
 		}
-		items, err := s.streamingCatalogMetas(ctx, catalogType, providerID)
+		items, err := s.streamingCatalogCatalogMetas(ctx, config, catalogType, providerID)
 		if err != nil {
 			return nil, err
 		}
@@ -2945,10 +3294,74 @@ const streamingCatalogJustWatchQuery = `query GetPopularTitles(
             imdbId
           }
           title
+          originalReleaseYear
           scoring {
             imdbScore
           }
           posterUrl(profile: $profile, format: $format)
+        }
+      }
+    }
+  }
+}`
+
+const streamingCatalogJustWatchNewTitlesQuery = `query GetNewTitles(
+  $country: Country!
+  $date: Date!
+  $filter: TitleFilter
+  $first: Int!
+  $language: Language!
+  $priceDrops: Boolean!
+  $pageType: NewPageType!
+  $bucketType: NewDateRangeBucket
+) {
+  newTitles(
+    country: $country
+    date: $date
+    filter: $filter
+    first: $first
+    priceDrops: $priceDrops
+    pageType: $pageType
+    bucketType: $bucketType
+  ) {
+    edges {
+      node {
+        __typename
+        ... on Movie {
+          objectType
+          content(country: $country, language: $language) {
+            title
+            originalReleaseYear
+            externalIds {
+              imdbId
+            }
+            scoring {
+              imdbScore
+            }
+            posterUrl
+          }
+        }
+        ... on Season {
+          objectType
+          content(country: $country, language: $language) {
+            title
+            seasonNumber
+            originalReleaseYear
+          }
+          show {
+            objectType
+            content(country: $country, language: $language) {
+              title
+              originalReleaseYear
+              externalIds {
+                imdbId
+              }
+              scoring {
+                imdbScore
+              }
+              posterUrl
+            }
+          }
         }
       }
     }

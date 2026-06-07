@@ -707,6 +707,10 @@ h3 {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.single-choice-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .choice-chip {
   min-height: 42px;
   display: flex;
