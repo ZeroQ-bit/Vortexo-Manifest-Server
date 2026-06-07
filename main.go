@@ -1011,6 +1011,7 @@ type plexDiscoverMetadata struct {
 	Image                 []plexDiscoverImage  `json:"Image,omitempty"`
 	Images                plexDiscoverImageSet `json:"images,omitempty"`
 	Guid                  []plexDiscoverGuid   `json:"Guid,omitempty"`
+	Guids                 []plexDiscoverGuid   `json:"guids,omitempty"`
 }
 
 type plexDiscoverSearchResponse struct {
@@ -2636,6 +2637,9 @@ func (s *appState) handlePlexPublicRowsSetup(w http.ResponseWriter, r *http.Requ
 		s.mu.RLock()
 		config := s.config.PlexPublicRows
 		s.mu.RUnlock()
+		if truthyQuery(r.URL.Query().Get("refresh")) {
+			s.clearPlexPublicRowsCache()
+		}
 		if section := strings.TrimSpace(r.URL.Query().Get("section")); section != "" {
 			config.Section = section
 		}
@@ -4403,7 +4407,7 @@ func (s *appState) plexPublicRowOptions(ctx context.Context, config plexPublicRo
 	s.plexPublicRowsMu.RLock()
 	cached, ok := s.plexPublicRows[cacheKey]
 	s.plexPublicRowsMu.RUnlock()
-	if ok && now.Before(cached.expires) {
+	if ok && now.Before(cached.expires) && len(cached.options) > 0 {
 		return markSelectedPlexPublicRowOptions(cached.options, config.SelectedRows), nil
 	}
 
@@ -4559,7 +4563,31 @@ func (s *appState) fetchPlexDiscoverSectionHubs(ctx context.Context, token strin
 	if err := s.plexJSON(ctx, http.MethodGet, components.String(), nil, s.plexDiscoverHeaders(token), &response); err != nil {
 		return nil, err
 	}
-	return s.hydratePlexDiscoverHubs(ctx, token, response.MediaContainer.Hub, count), nil
+	hubs := response.MediaContainer.Hub
+	if len(hubs) == 0 {
+		if len(response.MediaContainer.Metadata) > 0 {
+			hubs = append(hubs, plexDiscoverHub{
+				HubIdentifier: section + ".items",
+				Title:         "Plex " + section,
+				Type:          "mixed",
+				Key:           "/hubs/sections/" + section,
+				Metadata:      response.MediaContainer.Metadata,
+			})
+		} else if len(response.MediaContainer.Directory) > 0 {
+			hubs = append(hubs, plexDiscoverHub{
+				HubIdentifier: section + ".items",
+				Title:         "Plex " + section,
+				Type:          "mixed",
+				Key:           "/hubs/sections/" + section,
+				Metadata:      response.MediaContainer.Directory,
+			})
+		}
+	}
+	hydrated := s.hydratePlexDiscoverHubs(ctx, token, hubs, count)
+	if len(hydrated) == 0 && section == "home" {
+		hydrated = s.fallbackPlexDiscoverHomeHubs(ctx, token, count)
+	}
+	return hydrated, nil
 }
 
 func (s *appState) hydratePlexDiscoverHubs(ctx context.Context, token string, hubs []plexDiscoverHub, count int) []plexDiscoverHub {
@@ -4573,10 +4601,105 @@ func (s *appState) hydratePlexDiscoverHubs(ctx context.Context, token string, hu
 			}
 		}
 		if len(plexDiscoverHubItems(hub)) > 0 {
+			hub = s.hydratePlexDiscoverHubItemIDs(ctx, token, hub, count)
+			if plexDiscoverHubPublicItemCount(hub, token) > 0 {
+				out = append(out, hub)
+			}
+		}
+	}
+	return out
+}
+
+func (s *appState) fallbackPlexDiscoverHomeHubs(ctx context.Context, token string, count int) []plexDiscoverHub {
+	candidates := []plexDiscoverHub{
+		{HubIdentifier: "home.top_watchlisted", Title: "Most Watchlisted", Type: "mixed", Key: "/hubs/sections/home/top_watchlisted"},
+	}
+	out := make([]plexDiscoverHub, 0, len(candidates))
+	for _, candidate := range candidates {
+		hub, err := s.fetchPlexDiscoverHub(ctx, token, candidate, count)
+		if err != nil {
+			log.Printf("Plex public fallback hub failed %q: %v", firstNonEmpty(candidate.Title, candidate.Key), err)
+			continue
+		}
+		if len(plexDiscoverHubItems(hub)) == 0 {
+			continue
+		}
+		hub = s.hydratePlexDiscoverHubItemIDs(ctx, token, hub, count)
+		if plexDiscoverHubPublicItemCount(hub, token) > 0 {
 			out = append(out, hub)
 		}
 	}
 	return out
+}
+
+func plexDiscoverHubPublicItemCount(hub plexDiscoverHub, token string) int {
+	count := 0
+	for _, item := range plexDiscoverHubItems(hub) {
+		if _, ok := plexPublicHomeItemFromDiscover(item, token); ok {
+			count++
+		}
+	}
+	return count
+}
+
+func (s *appState) hydratePlexDiscoverHubItemIDs(ctx context.Context, token string, hub plexDiscoverHub, count int) plexDiscoverHub {
+	items := plexDiscoverHubItems(hub)
+	if len(items) == 0 {
+		return hub
+	}
+	limit := boundedInt(strconv.Itoa(count), plexPublicRowsDefaultItemLimit, 6, plexPublicRowsMaxItemLimit)
+	if limit > len(items) {
+		limit = len(items)
+	}
+	hydrated := make([]plexDiscoverMetadata, 0, limit)
+	for index, item := range items {
+		if index >= limit {
+			break
+		}
+		hydrated = append(hydrated, s.hydratePlexDiscoverMetadataIDs(ctx, token, item))
+	}
+	if len(hub.Metadata) > 0 {
+		hub.Metadata = hydrated
+	} else {
+		hub.Directory = hydrated
+	}
+	return hub
+}
+
+func (s *appState) hydratePlexDiscoverMetadataIDs(ctx context.Context, token string, meta plexDiscoverMetadata) plexDiscoverMetadata {
+	if plexDiscoverMetadataHasPublicIDs(meta) {
+		return meta
+	}
+	if discoverID := plexDiscoverMetadataID(meta); discoverID != "" {
+		if hydrated, err := s.getSignedPlexDiscoverMetadata(ctx, token, discoverID); err == nil && hydrated != nil {
+			merged := mergePlexDiscoverMetadata(meta, *hydrated)
+			if plexDiscoverMetadataHasPublicIDs(merged) {
+				return merged
+			}
+			meta = merged
+		}
+	}
+	title := firstNonEmpty(meta.Title, meta.OriginalTitle)
+	if title == "" {
+		return meta
+	}
+	results, err := s.searchSignedPlexDiscoverMetadata(ctx, token, title, 8)
+	if err != nil {
+		return meta
+	}
+	mediaType := normalizePlexArtworkMediaType(meta.Type)
+	if mediaType == "" {
+		mediaType = plexDiscoverPreferredType(meta.Type)
+	}
+	match := bestPlexDiscoverSearchMatch(results, plexArtworkSeedItem{
+		MediaType: mediaType,
+		Title:     title,
+		Year:      firstNonZero(meta.Year, yearFromText(meta.OriginallyAvailableAt)),
+	})
+	if match == nil {
+		return meta
+	}
+	return mergePlexDiscoverMetadata(meta, *match)
 }
 
 func (s *appState) fetchPlexDiscoverHub(ctx context.Context, token string, rootHub plexDiscoverHub, count int) (plexDiscoverHub, error) {
@@ -9081,6 +9204,11 @@ func plexDiscoverMetadataID(meta plexDiscoverMetadata) string {
 			return id
 		}
 	}
+	for _, guid := range meta.Guids {
+		if id := normalizedPlexDiscoverMetadataID(guid.ID); id != "" {
+			return id
+		}
+	}
 	return ""
 }
 
@@ -9128,6 +9256,9 @@ func plexDiscoverExternalIDs(meta plexDiscoverMetadata, preferredType string) (i
 	for _, guid := range meta.Guid {
 		values = append(values, guid.ID)
 	}
+	for _, guid := range meta.Guids {
+		values = append(values, guid.ID)
+	}
 
 	var tmdbID int
 	var imdbID string
@@ -9140,6 +9271,121 @@ func plexDiscoverExternalIDs(meta plexDiscoverMetadata, preferredType string) (i
 		}
 	}
 	return tmdbID, imdbID
+}
+
+func plexDiscoverMetadataHasPublicIDs(meta plexDiscoverMetadata) bool {
+	rawType := strings.ToLower(strings.TrimSpace(meta.Type))
+	switch rawType {
+	case "movie":
+		tmdbID, _ := plexDiscoverExternalIDs(meta, "movie")
+		return tmdbID > 0
+	case "show", "tv", "series":
+		tmdbID, _ := plexDiscoverExternalIDs(meta, "tv")
+		return tmdbID > 0
+	default:
+		return false
+	}
+}
+
+func mergePlexDiscoverMetadata(base plexDiscoverMetadata, override plexDiscoverMetadata) plexDiscoverMetadata {
+	out := base
+	if override.RatingKey != "" {
+		out.RatingKey = override.RatingKey
+	}
+	if override.Key != "" {
+		out.Key = override.Key
+	}
+	if override.GUID != "" {
+		out.GUID = override.GUID
+	}
+	if override.PrimaryGUID != "" {
+		out.PrimaryGUID = override.PrimaryGUID
+	}
+	if override.Type != "" {
+		out.Type = override.Type
+	}
+	if override.Title != "" {
+		out.Title = override.Title
+	}
+	if override.OriginalTitle != "" {
+		out.OriginalTitle = override.OriginalTitle
+	}
+	if override.Summary != "" {
+		out.Summary = override.Summary
+	}
+	if override.Year > 0 {
+		out.Year = override.Year
+	}
+	if override.Index > 0 {
+		out.Index = override.Index
+	}
+	if override.ParentIndex > 0 {
+		out.ParentIndex = override.ParentIndex
+	}
+	if override.LeafCount > 0 {
+		out.LeafCount = override.LeafCount
+	}
+	if override.ChildCount > 0 {
+		out.ChildCount = override.ChildCount
+	}
+	if override.Duration > 0 {
+		out.Duration = override.Duration
+	}
+	if override.Rating > 0 {
+		out.Rating = override.Rating
+	}
+	if override.AudienceRating > 0 {
+		out.AudienceRating = override.AudienceRating
+	}
+	if override.OriginallyAvailableAt != "" {
+		out.OriginallyAvailableAt = override.OriginallyAvailableAt
+	}
+	if override.PublicPagesURL != "" {
+		out.PublicPagesURL = override.PublicPagesURL
+	}
+	if override.Slug != "" {
+		out.Slug = override.Slug
+	}
+	if override.Thumb != "" {
+		out.Thumb = override.Thumb
+	}
+	if override.Art != "" {
+		out.Art = override.Art
+	}
+	if override.Banner != "" {
+		out.Banner = override.Banner
+	}
+	if len(override.Image) > 0 {
+		out.Image = override.Image
+	}
+	if !plexDiscoverImageSetIsZero(override.Images) {
+		out.Images = override.Images
+	}
+	if len(override.Guid) > 0 {
+		out.Guid = override.Guid
+	}
+	if len(override.Guids) > 0 {
+		out.Guids = override.Guids
+	}
+	return out
+}
+
+func plexDiscoverImageSetIsZero(images plexDiscoverImageSet) bool {
+	return images.CoverArt == "" &&
+		images.Landscape == "" &&
+		images.Wide == "" &&
+		images.Tile == "" &&
+		images.Snapshot == "" &&
+		images.Background == "" &&
+		images.BackgroundLandscape == "" &&
+		images.Art == "" &&
+		images.Hero == "" &&
+		images.ClearLogo == "" &&
+		images.Logo == "" &&
+		images.Thumbnail == "" &&
+		images.Thumb == "" &&
+		images.Poster == "" &&
+		images.CoverPoster == ""
 }
 
 func tmdbIDFromDiscoverValue(value string, preferredType string) int {
@@ -10932,6 +11178,15 @@ func boundedInt(raw string, fallback, min, max int) int {
 		return max
 	}
 	return value
+}
+
+func truthyQuery(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "y", "on", "refresh":
+		return true
+	default:
+		return false
+	}
 }
 
 func wantsJSON(r *http.Request) bool {

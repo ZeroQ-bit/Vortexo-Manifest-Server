@@ -617,12 +617,14 @@ function App() {
     const params = new URLSearchParams();
     params.set("section", section);
     params.set("item_limit", String(itemLimit));
+    params.set("refresh", "1");
     setBusy(true);
     setPlexPublicRowsStatus("Loading Plex row choices...");
     try {
       const data = await request(`/api/v1/bridge/plex-public-rows?${params.toString()}`);
       setPlexPublicRows((current) => mergePlexPublicRowsState(current, data));
-      setPlexPublicRowsStatus(data.error || `Loaded ${(data.rows || []).length} Plex row choices.`);
+      const rowTotal = (data.rows || []).length;
+      setPlexPublicRowsStatus(data.error || (rowTotal > 0 ? `Loaded ${rowTotal} Plex row choices.` : "No Plex row choices loaded."));
       await loadDashboard();
     } catch (error) {
       setMessage(error.message);
@@ -2006,7 +2008,7 @@ function toggleArrayValue(values, value) {
 
 function isErrorMessage(message) {
   const text = String(message || "").toLowerCase();
-  return text.includes("failed") || text.includes("error") || text.includes("invalid") || text.includes("required");
+  return text.includes("failed") || text.includes("error") || text.includes("invalid") || text.includes("required") || text.includes("no plex row choices");
 }
 
 createRoot(document.getElementById("root")).render(<App />);

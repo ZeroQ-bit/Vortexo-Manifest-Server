@@ -416,6 +416,40 @@ func TestPlexPublicHomeItemFromDiscoverUsesTMDBPublicRatingKey(t *testing.T) {
 	}
 }
 
+func TestPlexDiscoverExternalIDsUsesLowercaseGuids(t *testing.T) {
+	tmdbID, imdbID := plexDiscoverExternalIDs(plexDiscoverMetadata{
+		Type: "movie",
+		Guids: []plexDiscoverGuid{
+			{ID: "tmdb://movie/1042834"},
+			{ID: "imdb://tt1234567"},
+		},
+	}, "movie")
+	if tmdbID != 1042834 || imdbID != "tt1234567" {
+		t.Fatalf("expected lower-case guids to resolve public ids, got tmdb=%d imdb=%q", tmdbID, imdbID)
+	}
+}
+
+func TestMergePlexDiscoverMetadataAddsPublicIDs(t *testing.T) {
+	merged := mergePlexDiscoverMetadata(plexDiscoverMetadata{
+		Type:  "show",
+		Title: "Ghosts",
+		Thumb: "https://metadata-static.plex.tv/original-poster.jpg",
+	}, plexDiscoverMetadata{
+		Type:  "show",
+		Title: "Ghosts",
+		Guid: []plexDiscoverGuid{
+			{ID: "tmdb://tv/14658"},
+			{ID: "imdb://tt8594324"},
+		},
+	})
+	if !plexDiscoverMetadataHasPublicIDs(merged) {
+		t.Fatalf("expected merged Discover metadata to have public ids: %#v", merged)
+	}
+	if merged.Thumb != "https://metadata-static.plex.tv/original-poster.jpg" {
+		t.Fatalf("expected original artwork to be preserved, got %q", merged.Thumb)
+	}
+}
+
 func TestPlexPublicHomeRowFromHubFiltersUnplayableItems(t *testing.T) {
 	hub := plexDiscoverHub{
 		HubIdentifier: "popular-tv",
