@@ -132,6 +132,7 @@ type streamingCatalogSetupRequest struct {
 	Providers      []string `json:"providers"`
 	Types          []string `json:"types"`
 	MergeProviders bool     `json:"merge_providers,omitempty"`
+	MergeAll       bool     `json:"merge_all,omitempty"`
 	SortBy         string   `json:"sort_by,omitempty"`
 	RPDBKey        string   `json:"rpdb_key,omitempty"`
 }
@@ -146,6 +147,7 @@ type streamingCatalogAddonConfig struct {
 	Providers      []string `json:"providers"`
 	Types          []string `json:"types"`
 	MergeProviders bool     `json:"merge_providers,omitempty"`
+	MergeAll       bool     `json:"merge_all,omitempty"`
 	SortBy         string   `json:"sort_by,omitempty"`
 	RPDBKey        string   `json:"rpdb_key,omitempty"`
 }
@@ -413,6 +415,7 @@ var streamingCatalogDefaultProviders = []string{"nfx", "dnp", "amp", "atp", "hbm
 var streamingCatalogDefaultTypes = []string{"movie", "series"}
 var streamingCatalogDefaultSortBy = "TRENDING"
 var streamingCatalogMergedID = "merged"
+var streamingCatalogLatestReleasesID = "latest-releases"
 var streamingCatalogProviderOrder = []string{
 	"nfx", "nfk", "dnp", "amp", "atp", "hbm", "pmp", "hlu", "pcp", "cru",
 	"jhs", "zee", "vil", "nlz", "sst", "clv", "gop", "hay", "mgl", "cts",
@@ -2485,6 +2488,7 @@ func (s *appState) handleStreamingCatalogsSetup(w http.ResponseWriter, r *http.R
 			Providers:      req.Providers,
 			Types:          req.Types,
 			MergeProviders: req.MergeProviders,
+			MergeAll:       req.MergeAll,
 			SortBy:         req.SortBy,
 			RPDBKey:        req.RPDBKey,
 		})
@@ -2598,6 +2602,7 @@ func streamingCatalogSortOptions() []map[string]string {
 
 func streamingCatalogManifest(config streamingCatalogAddonConfig) stremioManifest {
 	config = normalizeStreamingCatalogConfig(config)
+	rows := streamingCatalogRows(config)
 	return stremioManifest{
 		ID:          streamingCatalogAddonID,
 		Name:        streamingCatalogAddonName,
@@ -2605,8 +2610,8 @@ func streamingCatalogManifest(config streamingCatalogAddonConfig) stremioManifes
 		Version:     "1.0.0",
 		Logo:        "https://play-lh.googleusercontent.com/TBRwjS_qfJCSj1m7zZB93FnpJM5fSpMA_wUlFDLxWAb45T9RmwBvQd5cWR5viJJOhkI",
 		Resources:   []any{"catalog"},
-		Types:       append([]string(nil), config.Types...),
-		Catalogs:    streamingCatalogRows(config),
+		Types:       streamingCatalogManifestTypes(config, rows),
+		Catalogs:    rows,
 		BehaviorHints: map[string]any{
 			"configurable": false,
 		},
@@ -2615,6 +2620,18 @@ func streamingCatalogManifest(config streamingCatalogAddonConfig) stremioManifes
 
 func streamingCatalogRows(config streamingCatalogAddonConfig) []stremioCatalog {
 	config = normalizeStreamingCatalogConfig(config)
+	if config.MergeAll {
+		enabledTypes := streamingCatalogEnabledTypes(config)
+		if len(enabledTypes) == 0 {
+			return []stremioCatalog{}
+		}
+		return []stremioCatalog{{
+			ID:   streamingCatalogLatestReleasesID,
+			Type: streamingCatalogMergedProviderRowType(enabledTypes),
+			Name: "Latest Releases",
+		}}
+	}
+
 	if config.MergeProviders {
 		rows := make([]stremioCatalog, 0, len(config.Providers))
 		for _, providerID := range config.Providers {
@@ -2659,12 +2676,39 @@ func streamingCatalogRows(config streamingCatalogAddonConfig) []stremioCatalog {
 	return rows
 }
 
+func streamingCatalogManifestTypes(config streamingCatalogAddonConfig, rows []stremioCatalog) []string {
+	seen := map[string]bool{}
+	types := make([]string, 0, len(config.Types)+len(rows))
+	for _, catalogType := range config.Types {
+		if catalogType == "" || seen[catalogType] {
+			continue
+		}
+		seen[catalogType] = true
+		types = append(types, catalogType)
+	}
+	for _, row := range rows {
+		catalogType := strings.TrimSpace(row.Type)
+		if catalogType == "" || seen[catalogType] {
+			continue
+		}
+		seen[catalogType] = true
+		types = append(types, catalogType)
+	}
+	return types
+}
+
 func streamingCatalogConfigIncludes(config streamingCatalogAddonConfig, catalogType string, providerID string) bool {
 	config = normalizeStreamingCatalogConfig(config)
 	catalogType = normalizeStreamingCatalogCatalogType(catalogType)
 	providerID = canonicalStreamingProviderID(providerID)
+	if providerID == streamingCatalogLatestReleasesID {
+		return config.MergeAll && catalogType == streamingCatalogMergedProviderRowType(streamingCatalogEnabledTypes(config))
+	}
 	if providerID == streamingCatalogMergedID {
 		return config.MergeProviders && streamingCatalogHasProviderForType(config, catalogType)
+	}
+	if config.MergeAll {
+		return false
 	}
 	provider, ok := streamingCatalogProviders[providerID]
 	if !ok {
@@ -2693,6 +2737,16 @@ func streamingCatalogConfigIncludes(config streamingCatalogAddonConfig, catalogT
 		}
 	}
 	return false
+}
+
+func streamingCatalogEnabledTypes(config streamingCatalogAddonConfig) []string {
+	enabled := make([]string, 0, len(config.Types))
+	for _, catalogType := range config.Types {
+		if streamingCatalogHasProviderForType(config, catalogType) {
+			enabled = append(enabled, catalogType)
+		}
+	}
+	return enabled
 }
 
 func streamingCatalogProviderEnabledTypes(config streamingCatalogAddonConfig, provider streamingCatalogProvider) []string {
@@ -2751,6 +2805,9 @@ func streamingCatalogHasProviderForType(config streamingCatalogAddonConfig, cata
 func normalizeStreamingCatalogConfig(config streamingCatalogAddonConfig) streamingCatalogAddonConfig {
 	config.Providers = normalizeStreamingCatalogProviders(config.Providers)
 	config.Types = normalizeStreamingCatalogTypes(config.Types)
+	if config.MergeAll {
+		config.MergeProviders = false
+	}
 	config.SortBy = normalizeStreamingCatalogSortBy(config.SortBy)
 	config.RPDBKey = strings.TrimSpace(config.RPDBKey)
 	return config
@@ -2809,6 +2866,8 @@ func canonicalStreamingProviderID(providerID string) string {
 		return "cru"
 	case "hst":
 		return "jhs"
+	case streamingCatalogLatestReleasesID:
+		return streamingCatalogLatestReleasesID
 	default:
 		return strings.ToLower(strings.TrimSpace(providerID))
 	}
@@ -2899,6 +2958,9 @@ func firstForwardedValue(value string) string {
 func (s *appState) streamingCatalogCatalogMetas(ctx context.Context, config streamingCatalogAddonConfig, catalogType string, catalogID string) ([]stremioMeta, error) {
 	config = normalizeStreamingCatalogConfig(config)
 	catalogID = canonicalStreamingProviderID(catalogID)
+	if catalogID == streamingCatalogLatestReleasesID {
+		return s.mergedAllStreamingCatalogMetas(ctx, config)
+	}
 	if catalogID == streamingCatalogMergedID {
 		return s.mergedStreamingCatalogMetas(ctx, config, catalogType)
 	}
@@ -2929,6 +2991,31 @@ func (s *appState) mergedStreamingProviderMetas(ctx context.Context, config stre
 			continue
 		}
 		groups = append(groups, streamingCatalogItemGroup{id: catalogType, items: items})
+	}
+	if len(groups) == 0 {
+		return []stremioMeta{}, nil
+	}
+	return mergeStreamingCatalogItemGroups(groups, config.SortBy), nil
+}
+
+func (s *appState) mergedAllStreamingCatalogMetas(ctx context.Context, config streamingCatalogAddonConfig) ([]stremioMeta, error) {
+	groups := make([]streamingCatalogItemGroup, 0, len(config.Providers)*len(config.Types))
+	for _, providerID := range config.Providers {
+		provider, ok := streamingCatalogProviders[providerID]
+		if !ok {
+			continue
+		}
+		for _, catalogType := range streamingCatalogProviderEnabledTypes(config, provider) {
+			items, err := s.streamingCatalogMetas(ctx, catalogType, providerID, config.SortBy)
+			if err != nil {
+				log.Printf("streaming catalog %s/%s merge-all source failed: %v", catalogType, providerID, err)
+				continue
+			}
+			if len(items) == 0 {
+				continue
+			}
+			groups = append(groups, streamingCatalogItemGroup{id: providerID + ":" + catalogType, items: items})
+		}
 	}
 	if len(groups) == 0 {
 		return []stremioMeta{}, nil

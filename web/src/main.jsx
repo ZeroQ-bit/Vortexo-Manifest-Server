@@ -124,6 +124,7 @@ function App() {
     providers: ["nfx", "dnp", "amp", "atp", "hbm"],
     types: ["movie", "series"],
     mergeProviders: false,
+    mergeAll: false,
     sortBy: "TRENDING",
     rpdbKey: "",
   });
@@ -515,6 +516,7 @@ function App() {
           providers: streamingCatalogs.providers,
           types: streamingCatalogs.types,
           merge_providers: streamingCatalogs.mergeProviders,
+          merge_all: streamingCatalogs.mergeAll,
           sort_by: streamingCatalogs.sortBy,
           rpdb_key: streamingCatalogs.rpdbKey.trim(),
         }),
@@ -1236,6 +1238,14 @@ function LiveTV({ rows, summary }) {
 }
 
 function Setup({ perfect, setPerfect, streamingCatalogs, setStreamingCatalogs, onSubmit, onStreamingSubmit, busy }) {
+  const streamingLayout = streamingCatalogs.mergeAll ? "all" : streamingCatalogs.mergeProviders ? "provider" : "separate";
+  const setStreamingLayout = (layout) => setStreamingCatalogs({
+    ...streamingCatalogs,
+    mergeProviders: layout === "provider",
+    mergeAll: layout === "all",
+    sortBy: layout === "all" ? "NEW" : streamingCatalogs.sortBy,
+  });
+
   return (
     <section className="stack">
       <form className="panel" onSubmit={onStreamingSubmit}>
@@ -1286,17 +1296,21 @@ function Setup({ perfect, setPerfect, streamingCatalogs, setStreamingCatalogs, o
           <div className="choice-block">
             <span>Layout</span>
             <div className="choice-grid single-choice-grid">
-              <label className={streamingCatalogs.mergeProviders ? "choice-chip selected" : "choice-chip"}>
-                <input
-                  type="checkbox"
-                  checked={streamingCatalogs.mergeProviders}
-                  onChange={() => setStreamingCatalogs({
-                    ...streamingCatalogs,
-                    mergeProviders: !streamingCatalogs.mergeProviders,
-                  })}
-                />
-                Merge movies + shows
-              </label>
+              {[
+                ["separate", "Separate rows"],
+                ["provider", "Merge movies + shows"],
+                ["all", "Latest Releases"],
+              ].map(([id, label]) => (
+                <label className={streamingLayout === id ? "choice-chip selected" : "choice-chip"} key={id}>
+                  <input
+                    type="radio"
+                    name="streaming-layout"
+                    checked={streamingLayout === id}
+                    onChange={() => setStreamingLayout(id)}
+                  />
+                  {label}
+                </label>
+              ))}
             </div>
           </div>
         </div>
