@@ -37,6 +37,10 @@ const (
 	streamingCatalogJustWatchLimit  = 100
 	streamingCatalogNewLookbackDays = 30
 	streamingCatalogJustWatchURL    = "https://apis.justwatch.com/graphql"
+	tmdbAPIBaseURL                  = "https://api.themoviedb.org"
+	tmdbKeywordRowsDefaultCount     = 10
+	tmdbKeywordRowsMaxCount         = 50
+	tmdbKeywordRowMaxItems          = 50
 	plexProduct                     = "Vortexo Manifest Server"
 	plexVersion                     = "1.0.0"
 	plexPlatform                    = "Go"
@@ -69,6 +73,9 @@ type appState struct {
 	watchMeta                map[string]watchStateMetadataCacheEntry
 	streamingCatalogMu       sync.RWMutex
 	streamingCatalogs        map[string]streamingCatalogCacheEntry
+	tmdbKeywordMu            sync.RWMutex
+	tmdbKeywordRows          map[string]tmdbKeywordRowsCacheEntry
+	tmdbKeywordIDs           map[string]tmdbKeywordIDCacheEntry
 	plexArtworkMu            sync.RWMutex
 	plexArtwork              map[string]plexArtworkCacheRecord
 	plexArtworkSyncMu        sync.Mutex
@@ -80,14 +87,15 @@ type appState struct {
 }
 
 type bridgeConfig struct {
-	AdminUsername    string              `json:"admin_username"`
-	AdminPassword    string              `json:"admin_password"`
-	AuthToken        string              `json:"auth_token"`
-	AddonRegistryURL string              `json:"addon_registry_url,omitempty"`
-	Manifests        []installedManifest `json:"manifests"`
-	Catalogs         []catalogPreference `json:"catalogs,omitempty"`
-	Plex             plexAuthConfig      `json:"plex,omitempty"`
-	Watch            watchSyncConfig     `json:"watch,omitempty"`
+	AdminUsername    string                `json:"admin_username"`
+	AdminPassword    string                `json:"admin_password"`
+	AuthToken        string                `json:"auth_token"`
+	AddonRegistryURL string                `json:"addon_registry_url,omitempty"`
+	Manifests        []installedManifest   `json:"manifests"`
+	Catalogs         []catalogPreference   `json:"catalogs,omitempty"`
+	Plex             plexAuthConfig        `json:"plex,omitempty"`
+	Watch            watchSyncConfig       `json:"watch,omitempty"`
+	TMDBKeywordRows  tmdbKeywordRowsConfig `json:"tmdb_keyword_rows,omitempty"`
 }
 
 type plexAuthConfig struct {
@@ -118,6 +126,16 @@ type traktWatchConfig struct {
 	LastSyncAt     time.Time `json:"last_sync_at,omitempty"`
 }
 
+type tmdbKeywordRowsConfig struct {
+	Enabled         bool      `json:"enabled,omitempty"`
+	RowCount        int       `json:"row_count,omitempty"`
+	TMDBAPIKey      string    `json:"tmdb_api_key,omitempty"`
+	TMDBAccessToken string    `json:"tmdb_access_token,omitempty"`
+	Language        string    `json:"language,omitempty"`
+	Region          string    `json:"region,omitempty"`
+	UpdatedAt       time.Time `json:"updated_at,omitempty"`
+}
+
 type installedManifest struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`
@@ -135,6 +153,16 @@ type streamingCatalogSetupRequest struct {
 	MergeAll       bool     `json:"merge_all,omitempty"`
 	SortBy         string   `json:"sort_by,omitempty"`
 	RPDBKey        string   `json:"rpdb_key,omitempty"`
+}
+
+type tmdbKeywordRowsRequest struct {
+	Enabled          bool   `json:"enabled"`
+	RowCount         int    `json:"row_count"`
+	TMDBAPIKey       string `json:"tmdb_api_key"`
+	TMDBAccessToken  string `json:"tmdb_access_token"`
+	Language         string `json:"language"`
+	Region           string `json:"region"`
+	ClearCredentials bool   `json:"clear_credentials"`
 }
 
 type streamingCatalogSetupResponse struct {
@@ -162,6 +190,16 @@ type streamingCatalogProvider struct {
 
 type streamingCatalogCacheEntry struct {
 	items   []stremioMeta
+	expires time.Time
+}
+
+type tmdbKeywordRowsCacheEntry struct {
+	items   []vortexoHomeItem
+	expires time.Time
+}
+
+type tmdbKeywordIDCacheEntry struct {
+	id      int
 	expires time.Time
 }
 
@@ -1171,6 +1209,8 @@ func run() error {
 		manifest:          map[string]manifestCacheEntry{},
 		watchMeta:         map[string]watchStateMetadataCacheEntry{},
 		streamingCatalogs: map[string]streamingCatalogCacheEntry{},
+		tmdbKeywordRows:   map[string]tmdbKeywordRowsCacheEntry{},
+		tmdbKeywordIDs:    map[string]tmdbKeywordIDCacheEntry{},
 		plexArtwork:       map[string]plexArtworkCacheRecord{},
 	}
 	if err := state.load(); err != nil {
@@ -1206,6 +1246,7 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/bridge/addon-registry", s.requireAuth(s.handleAddonRegistry))
 	mux.HandleFunc("/api/v1/bridge/catalogs", s.requireAuth(s.handleCatalogPreferences))
 	mux.HandleFunc("/api/v1/bridge/streaming-catalogs", s.requireAuth(s.handleStreamingCatalogsSetup))
+	mux.HandleFunc("/api/v1/bridge/tmdb-keyword-rows", s.requireAuth(s.handleTMDBKeywordRowsSetup))
 	mux.HandleFunc("/api/v1/bridge/perfect-setup", s.requireAuth(s.handlePerfectSetup))
 	mux.HandleFunc("/api/v1/bridge/manifests", s.requireAuth(s.handleManifests))
 	mux.HandleFunc("/api/v1/bridge/manifests/", s.requireAuth(s.handleManifestByID))
@@ -1291,6 +1332,11 @@ func (s *appState) load() error {
 	}
 	if s.config.Catalogs == nil {
 		s.config.Catalogs = []catalogPreference{}
+		changed = true
+	}
+	normalizedKeywords := normalizeTMDBKeywordRowsConfig(s.config.TMDBKeywordRows)
+	if normalizedKeywords != s.config.TMDBKeywordRows {
+		s.config.TMDBKeywordRows = normalizedKeywords
 		changed = true
 	}
 	for i := range s.config.Manifests {
@@ -2244,6 +2290,7 @@ func (s *appState) handleBridgeDashboard(w http.ResponseWriter, r *http.Request)
 	prefs := catalogPreferenceMapLocked(s.config.Catalogs)
 	registryURL := firstNonEmpty(s.config.AddonRegistryURL, defaultRegistryURL)
 	watch := s.config.Watch
+	tmdbKeywordRows := s.config.TMDBKeywordRows
 	watchCount := len(s.watchState.Items)
 	watchUpdatedAt := s.watchState.UpdatedAt
 	s.mu.RUnlock()
@@ -2297,10 +2344,11 @@ func (s *appState) handleBridgeDashboard(w http.ResponseWriter, r *http.Request)
 			"name": "Vortexo Add-on Server",
 			"time": time.Now().UTC(),
 		},
-		"manifests":    manifests,
-		"catalogs":     allCatalogs,
-		"registry_url": registryURL,
-		"artwork":      s.plexArtworkDashboardStats(),
+		"manifests":         manifests,
+		"catalogs":          allCatalogs,
+		"registry_url":      registryURL,
+		"artwork":           s.plexArtworkDashboardStats(),
+		"tmdb_keyword_rows": tmdbKeywordRowsDashboardSummary(tmdbKeywordRows, time.Now().UTC()),
 		"watch": map[string]any{
 			"count":               watchCount,
 			"updated_at":          watchUpdatedAt,
@@ -2463,6 +2511,58 @@ func (s *appState) handleCatalogPreferences(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		respondJSON(w, http.StatusOK, map[string]any{"ok": true, "catalogs": s.dashboardCatalogs(r.Context())})
+	default:
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *appState) handleTMDBKeywordRowsSetup(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.mu.RLock()
+		config := s.config.TMDBKeywordRows
+		s.mu.RUnlock()
+		respondJSON(w, http.StatusOK, tmdbKeywordRowsDashboardSummary(config, time.Now().UTC()))
+	case http.MethodPost:
+		var req tmdbKeywordRowsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			respondError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+
+		s.mu.Lock()
+		next := s.config.TMDBKeywordRows
+		next.Enabled = req.Enabled
+		next.RowCount = req.RowCount
+		next.Language = firstNonEmpty(req.Language, next.Language)
+		next.Region = firstNonEmpty(req.Region, next.Region)
+		if req.ClearCredentials {
+			next.TMDBAPIKey = ""
+			next.TMDBAccessToken = ""
+		}
+		if strings.TrimSpace(req.TMDBAPIKey) != "" {
+			next.TMDBAPIKey = strings.TrimSpace(req.TMDBAPIKey)
+		}
+		if strings.TrimSpace(req.TMDBAccessToken) != "" {
+			next.TMDBAccessToken = strings.TrimSpace(req.TMDBAccessToken)
+		}
+		next.UpdatedAt = time.Now().UTC()
+		next = normalizeTMDBKeywordRowsConfig(next)
+		if req.Enabled && !tmdbKeywordRowsHasCredentials(next) {
+			s.mu.Unlock()
+			respondError(w, http.StatusBadRequest, "TMDB API key or read access token is required")
+			return
+		}
+		s.config.TMDBKeywordRows = next
+		err := s.saveLocked()
+		s.mu.Unlock()
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, "failed to save TMDB keyword rows")
+			return
+		}
+
+		s.clearTMDBKeywordRowsCache()
+		respondJSON(w, http.StatusOK, tmdbKeywordRowsDashboardSummary(next, time.Now().UTC()))
 	default:
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -3431,6 +3531,456 @@ func (s *appState) localStreamingCatalogValue(ctx context.Context, path string) 
 	return nil, fmt.Errorf("streaming catalogs route not found")
 }
 
+type tmdbKeywordSearchResponse struct {
+	Results []struct {
+		ID   int    `json:"id"`
+		Name string `json:"name"`
+	} `json:"results"`
+}
+
+type tmdbDiscoverResponse struct {
+	Results    []tmdbDiscoverResult `json:"results"`
+	TotalPages int                  `json:"total_pages"`
+}
+
+type tmdbDiscoverResult struct {
+	ID               int     `json:"id"`
+	Title            string  `json:"title"`
+	Name             string  `json:"name"`
+	OriginalTitle    string  `json:"original_title"`
+	OriginalName     string  `json:"original_name"`
+	Overview         string  `json:"overview"`
+	PosterPath       string  `json:"poster_path"`
+	BackdropPath     string  `json:"backdrop_path"`
+	ReleaseDate      string  `json:"release_date"`
+	FirstAirDate     string  `json:"first_air_date"`
+	OriginalLanguage string  `json:"original_language"`
+	GenreIDs         []int   `json:"genre_ids"`
+	VoteAverage      float64 `json:"vote_average"`
+}
+
+func normalizeTMDBKeywordRowsConfig(config tmdbKeywordRowsConfig) tmdbKeywordRowsConfig {
+	config.TMDBAPIKey = strings.TrimSpace(config.TMDBAPIKey)
+	config.TMDBAccessToken = strings.TrimSpace(config.TMDBAccessToken)
+	config.Language = firstNonEmpty(strings.TrimSpace(config.Language), "en-US")
+	config.Region = strings.ToUpper(firstNonEmpty(strings.TrimSpace(config.Region), "US"))
+	if config.RowCount <= 0 {
+		config.RowCount = tmdbKeywordRowsDefaultCount
+	}
+	if config.RowCount > tmdbKeywordRowsMaxCount {
+		config.RowCount = tmdbKeywordRowsMaxCount
+	}
+	if !tmdbKeywordRowsHasCredentials(config) {
+		config.Enabled = false
+	}
+	return config
+}
+
+func tmdbKeywordRowsHasCredentials(config tmdbKeywordRowsConfig) bool {
+	return strings.TrimSpace(config.TMDBAPIKey) != "" || strings.TrimSpace(config.TMDBAccessToken) != ""
+}
+
+func tmdbKeywordRowsDashboardSummary(config tmdbKeywordRowsConfig, now time.Time) map[string]any {
+	config = normalizeTMDBKeywordRowsConfig(config)
+	bucket, next := tmdbKeywordRowsRotation(now)
+	return map[string]any{
+		"enabled":           config.Enabled,
+		"row_count":         config.RowCount,
+		"has_api_key":       strings.TrimSpace(config.TMDBAPIKey) != "",
+		"has_access_token":  strings.TrimSpace(config.TMDBAccessToken) != "",
+		"language":          config.Language,
+		"region":            config.Region,
+		"current_bucket":    bucket,
+		"next_rotation_at":  next,
+		"current_phrases":   tmdbKeywordSelectedPhrases(bucket, config.RowCount),
+		"max_row_count":     tmdbKeywordRowsMaxCount,
+		"default_row_count": tmdbKeywordRowsDefaultCount,
+	}
+}
+
+func (s *appState) tmdbKeywordHomeRows(ctx context.Context, itemLimit int, rowLimit int, now time.Time) ([]vortexoHomeRow, time.Time) {
+	s.mu.RLock()
+	config := s.config.TMDBKeywordRows
+	s.mu.RUnlock()
+	config = normalizeTMDBKeywordRowsConfig(config)
+	bucket, nextRotation := tmdbKeywordRowsRotation(now)
+	if !config.Enabled || !tmdbKeywordRowsHasCredentials(config) || rowLimit <= 0 {
+		return []vortexoHomeRow{}, time.Time{}
+	}
+
+	count := minInt(config.RowCount, rowLimit)
+	phrases := tmdbKeywordSelectedPhrases(bucket, count)
+	rows := make([]vortexoHomeRow, 0, len(phrases))
+	for _, phrase := range phrases {
+		items, err := s.tmdbKeywordRowItems(ctx, config, phrase, itemLimit, bucket, nextRotation)
+		if err != nil {
+			log.Printf("TMDB keyword row %q failed: %v", phrase, err)
+			continue
+		}
+		if len(items) == 0 {
+			continue
+		}
+		rows = append(rows, vortexoHomeRow{
+			ID:           "tmdb-keyword-" + slug(phrase) + "-" + strconv.FormatInt(bucket.Unix()/3600, 10),
+			Title:        tmdbKeywordDisplayName(phrase),
+			Reason:       "Hourly TMDB keyword row",
+			RefreshAfter: nextRotation,
+			Items:        items,
+		})
+	}
+	return rows, nextRotation
+}
+
+func (s *appState) tmdbKeywordRowItems(ctx context.Context, config tmdbKeywordRowsConfig, phrase string, itemLimit int, bucket time.Time, expires time.Time) ([]vortexoHomeItem, error) {
+	itemLimit = boundedInt(strconv.Itoa(itemLimit), 30, 6, tmdbKeywordRowMaxItems)
+	cacheKey := strings.Join([]string{
+		strconv.FormatInt(bucket.Unix()/3600, 10),
+		config.Language,
+		config.Region,
+		strconv.Itoa(itemLimit),
+		strings.ToLower(strings.TrimSpace(phrase)),
+	}, ":")
+
+	s.tmdbKeywordMu.RLock()
+	cached, ok := s.tmdbKeywordRows[cacheKey]
+	s.tmdbKeywordMu.RUnlock()
+	if ok && time.Now().UTC().Before(cached.expires) {
+		return append([]vortexoHomeItem(nil), cached.items...), nil
+	}
+
+	keywordID, err := s.resolveTMDBKeywordID(ctx, config, phrase)
+	if err != nil {
+		return nil, err
+	}
+	movies, movieErr := s.fetchTMDBKeywordDiscoverItems(ctx, config, "movie", keywordID, itemLimit)
+	shows, showErr := s.fetchTMDBKeywordDiscoverItems(ctx, config, "tv", keywordID, itemLimit)
+	if movieErr != nil {
+		log.Printf("TMDB keyword movie discover %q failed: %v", phrase, movieErr)
+	}
+	if showErr != nil {
+		log.Printf("TMDB keyword TV discover %q failed: %v", phrase, showErr)
+	}
+	if len(movies) == 0 && len(shows) == 0 {
+		if movieErr != nil {
+			return nil, movieErr
+		}
+		if showErr != nil {
+			return nil, showErr
+		}
+	}
+
+	combined := append(movies, shows...)
+	seen := map[string]bool{}
+	items := make([]vortexoHomeItem, 0, minInt(itemLimit, len(combined)))
+	sort.SliceStable(combined, func(i, j int) bool {
+		leftKey := homeDedupeKey(combined[i])
+		rightKey := homeDedupeKey(combined[j])
+		leftHash := stableHash64(strconv.FormatInt(bucket.Unix()/3600, 10) + ":" + phrase + ":" + leftKey)
+		rightHash := stableHash64(strconv.FormatInt(bucket.Unix()/3600, 10) + ":" + phrase + ":" + rightKey)
+		if leftHash != rightHash {
+			return leftHash < rightHash
+		}
+		return strings.ToLower(combined[i].Title) < strings.ToLower(combined[j].Title)
+	})
+	for _, item := range combined {
+		key := homeDedupeKey(item)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		items = append(items, item)
+		if len(items) >= itemLimit {
+			break
+		}
+	}
+
+	s.tmdbKeywordMu.Lock()
+	s.tmdbKeywordRows[cacheKey] = tmdbKeywordRowsCacheEntry{
+		items:   append([]vortexoHomeItem(nil), items...),
+		expires: expires,
+	}
+	s.tmdbKeywordMu.Unlock()
+	return items, nil
+}
+
+func (s *appState) resolveTMDBKeywordID(ctx context.Context, config tmdbKeywordRowsConfig, phrase string) (int, error) {
+	phrase = strings.TrimSpace(phrase)
+	if phrase == "" {
+		return 0, fmt.Errorf("empty TMDB keyword phrase")
+	}
+	cacheKey := strings.ToLower(phrase)
+	now := time.Now().UTC()
+	s.tmdbKeywordMu.RLock()
+	cached, ok := s.tmdbKeywordIDs[cacheKey]
+	s.tmdbKeywordMu.RUnlock()
+	if ok && now.Before(cached.expires) {
+		return cached.id, nil
+	}
+
+	var response tmdbKeywordSearchResponse
+	if err := s.tmdbGetJSON(ctx, config, "/3/search/keyword", []plexQueryItem{
+		{Name: "query", Value: phrase},
+	}, &response); err != nil {
+		return 0, err
+	}
+
+	var keywordID int
+	normalizedPhrase := strings.ToLower(phrase)
+	for _, result := range response.Results {
+		if strings.ToLower(strings.TrimSpace(result.Name)) == normalizedPhrase {
+			keywordID = result.ID
+			break
+		}
+	}
+	if keywordID == 0 && len(response.Results) > 0 {
+		keywordID = response.Results[0].ID
+	}
+	if keywordID <= 0 {
+		return 0, fmt.Errorf("TMDB keyword %q not found", phrase)
+	}
+
+	s.tmdbKeywordMu.Lock()
+	s.tmdbKeywordIDs[cacheKey] = tmdbKeywordIDCacheEntry{
+		id:      keywordID,
+		expires: now.Add(24 * time.Hour),
+	}
+	s.tmdbKeywordMu.Unlock()
+	return keywordID, nil
+}
+
+func (s *appState) fetchTMDBKeywordDiscoverItems(ctx context.Context, config tmdbKeywordRowsConfig, endpointType string, keywordID int, limit int) ([]vortexoHomeItem, error) {
+	limit = boundedInt(strconv.Itoa(limit), 30, 6, tmdbKeywordRowMaxItems)
+	endpointType = strings.ToLower(strings.TrimSpace(endpointType))
+	if endpointType != "movie" && endpointType != "tv" {
+		return nil, fmt.Errorf("unsupported TMDB discover endpoint %q", endpointType)
+	}
+
+	items := make([]vortexoHomeItem, 0, limit)
+	totalPages := 1
+	for page := 1; len(items) < limit && page <= totalPages && page <= 3; page++ {
+		var response tmdbDiscoverResponse
+		err := s.tmdbGetJSON(ctx, config, "/3/discover/"+endpointType, []plexQueryItem{
+			{Name: "include_adult", Value: "false"},
+			{Name: "sort_by", Value: "popularity.desc"},
+			{Name: "with_keywords", Value: strconv.Itoa(keywordID)},
+			{Name: "page", Value: strconv.Itoa(page)},
+		}, &response)
+		if err != nil {
+			return items, err
+		}
+		totalPages = maxInt(response.TotalPages, 1)
+		for _, result := range response.Results {
+			item := tmdbKeywordHomeItem(result, endpointType)
+			if item.TMDBID <= 0 || strings.TrimSpace(item.Title) == "" {
+				continue
+			}
+			items = append(items, item)
+			if len(items) >= limit {
+				break
+			}
+		}
+	}
+	return items, nil
+}
+
+func (s *appState) tmdbGetJSON(ctx context.Context, config tmdbKeywordRowsConfig, path string, queryItems []plexQueryItem, target any) error {
+	config = normalizeTMDBKeywordRowsConfig(config)
+	if !tmdbKeywordRowsHasCredentials(config) {
+		return fmt.Errorf("TMDB API key or read access token is required")
+	}
+	components, err := url.Parse(tmdbAPIBaseURL)
+	if err != nil {
+		return err
+	}
+	components.Path = path
+	query := components.Query()
+	if strings.TrimSpace(config.TMDBAccessToken) == "" {
+		query.Set("api_key", config.TMDBAPIKey)
+	}
+	if strings.TrimSpace(config.Language) != "" {
+		query.Set("language", config.Language)
+	}
+	if strings.TrimSpace(config.Region) != "" {
+		query.Set("region", config.Region)
+	}
+	for _, item := range queryItems {
+		if strings.TrimSpace(item.Name) != "" {
+			query.Set(item.Name, item.Value)
+		}
+	}
+	components.RawQuery = query.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, components.String(), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "VortexoManifestServer/1.0")
+	if strings.TrimSpace(config.TMDBAccessToken) != "" {
+		req.Header.Set("Authorization", "Bearer "+config.TMDBAccessToken)
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("TMDB %s failed: HTTP %d %s", path, resp.StatusCode, responseMessage(data))
+	}
+	return json.Unmarshal(data, target)
+}
+
+func tmdbKeywordHomeItem(result tmdbDiscoverResult, endpointType string) vortexoHomeItem {
+	mediaType := "movie"
+	date := result.ReleaseDate
+	if endpointType == "tv" {
+		mediaType = "tv"
+		date = result.FirstAirDate
+	}
+	tmdbID := result.ID
+	title := firstNonEmpty(result.Title, result.Name)
+	id := "tmdb:" + strconv.Itoa(tmdbID)
+	guid := "tmdb://" + mediaType + "/" + strconv.Itoa(tmdbID)
+	ratingType := mediaType
+	if ratingType == "tv" {
+		ratingType = "show"
+	}
+	return vortexoHomeItem{
+		ID:               id,
+		RatingKey:        "vortexo:" + ratingType + ":" + id,
+		Key:              guid,
+		GUID:             guid,
+		MediaType:        mediaType,
+		TMDBID:           tmdbID,
+		Title:            title,
+		OriginalTitle:    firstNonEmpty(result.OriginalTitle, result.OriginalName),
+		Overview:         result.Overview,
+		PosterPath:       tmdbImageURL(result.PosterPath, "w500"),
+		BackdropPath:     tmdbImageURL(result.BackdropPath, "w780"),
+		LandscapePath:    tmdbImageURL(result.BackdropPath, "w780"),
+		OriginalLanguage: result.OriginalLanguage,
+		Year:             yearFromText(date),
+		VoteAverage:      result.VoteAverage,
+		ReleaseDate:      date,
+		FirstAirDate:     result.FirstAirDate,
+		AddedAt:          time.Now().Unix(),
+		UpdatedAt:        time.Now().Unix(),
+	}
+}
+
+func tmdbImageURL(path string, size string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	size = firstNonEmpty(strings.TrimSpace(size), "w500")
+	return "https://image.tmdb.org/t/p/" + size + "/" + strings.TrimLeft(path, "/")
+}
+
+func tmdbKeywordRowsRotation(now time.Time) (time.Time, time.Time) {
+	bucket := now.UTC().Truncate(time.Hour)
+	return bucket, bucket.Add(time.Hour)
+}
+
+func tmdbKeywordSelectedPhrases(bucket time.Time, count int) []string {
+	count = boundedInt(strconv.Itoa(count), tmdbKeywordRowsDefaultCount, 1, tmdbKeywordRowsMaxCount)
+	phrases := append([]string(nil), tmdbKeywordPhrasePool...)
+	seed := strconv.FormatInt(bucket.UTC().Unix()/3600, 10)
+	sort.SliceStable(phrases, func(i, j int) bool {
+		leftHash := stableHash64(seed + ":" + phrases[i])
+		rightHash := stableHash64(seed + ":" + phrases[j])
+		if leftHash != rightHash {
+			return leftHash < rightHash
+		}
+		return phrases[i] < phrases[j]
+	})
+	if len(phrases) > count {
+		phrases = phrases[:count]
+	}
+	return phrases
+}
+
+func tmdbKeywordDisplayName(phrase string) string {
+	parts := strings.Fields(strings.TrimSpace(phrase))
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		parts[i] = strings.ToUpper(part[:1]) + part[1:]
+	}
+	return strings.Join(parts, " ")
+}
+
+func stableHash64(value string) uint64 {
+	var hash uint64 = 1469598103934665603
+	for _, b := range []byte(value) {
+		hash ^= uint64(b)
+		hash *= 1099511628211
+	}
+	return hash
+}
+
+func (s *appState) clearTMDBKeywordRowsCache() {
+	s.tmdbKeywordMu.Lock()
+	s.tmdbKeywordRows = map[string]tmdbKeywordRowsCacheEntry{}
+	s.tmdbKeywordIDs = map[string]tmdbKeywordIDCacheEntry{}
+	s.tmdbKeywordMu.Unlock()
+}
+
+var tmdbKeywordPhrasePool = []string{
+	"mind bending",
+	"crime thriller",
+	"spy drama",
+	"space adventure",
+	"survival",
+	"post apocalypse",
+	"serial killer",
+	"time travel",
+	"courtroom drama",
+	"heist",
+	"revenge",
+	"martial arts",
+	"coming of age",
+	"cyberpunk",
+	"supernatural mystery",
+	"political thriller",
+	"dark comedy",
+	"gangster",
+	"war epic",
+	"small town secrets",
+	"vigilante",
+	"road trip",
+	"alien invasion",
+	"medical drama",
+	"prison break",
+	"fantasy quest",
+	"period romance",
+	"sports underdog",
+	"disaster",
+	"psychological drama",
+	"family saga",
+	"monster",
+	"tech thriller",
+	"conspiracy",
+	"noir",
+	"detective",
+	"holiday chaos",
+	"anime action",
+	"school drama",
+	"zombie outbreak",
+	"ocean adventure",
+	"western",
+	"musical",
+	"dystopia",
+	"assassin",
+	"biopic",
+	"treasure hunt",
+	"parallel universe",
+	"true crime",
+	"cozy mystery",
+}
+
 const streamingCatalogJustWatchQuery = `query GetPopularTitles(
   $country: Country!
   $popularTitlesFilter: TitleFilter
@@ -4049,13 +4599,45 @@ func (s *appState) handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *appState) handleVortexoHome(w http.ResponseWriter, r *http.Request) {
-	rowLimit := boundedInt(r.URL.Query().Get("row_limit"), 8, 1, 12)
+	defaultRowLimit := 12
+	s.mu.RLock()
+	keywordConfig := normalizeTMDBKeywordRowsConfig(s.config.TMDBKeywordRows)
+	s.mu.RUnlock()
+	if keywordConfig.Enabled {
+		defaultRowLimit = maxInt(defaultRowLimit, keywordConfig.RowCount)
+	}
+	rowLimit := boundedInt(r.URL.Query().Get("row_limit"), defaultRowLimit, 1, 60)
 	itemLimit := boundedInt(r.URL.Query().Get("item_limit"), 30, 6, 50)
 
 	entries := s.enabledCatalogEntries(r.Context())
 	rows := make([]vortexoHomeRow, 0, rowLimit)
 	used := map[string]bool{}
 	now := time.Now().UTC()
+	refreshAfter := now.Add(time.Hour)
+
+	keywordRows, keywordRefreshAfter := s.tmdbKeywordHomeRows(r.Context(), itemLimit, rowLimit, now)
+	if !keywordRefreshAfter.IsZero() {
+		refreshAfter = minTime(refreshAfter, keywordRefreshAfter)
+	}
+	for _, row := range keywordRows {
+		if len(rows) >= rowLimit {
+			break
+		}
+		rowItems := make([]vortexoHomeItem, 0, len(row.Items))
+		for _, item := range row.Items {
+			key := homeDedupeKey(item)
+			if key == "" || used[key] {
+				continue
+			}
+			used[key] = true
+			rowItems = append(rowItems, item)
+		}
+		if len(rowItems) == 0 {
+			continue
+		}
+		row.Items = rowItems
+		rows = append(rows, row)
+	}
 
 	for _, entry := range entries {
 		if len(rows) >= rowLimit {
@@ -4095,14 +4677,14 @@ func (s *appState) handleVortexoHome(w http.ResponseWriter, r *http.Request) {
 			ID:           slug(entry.Pref.Key),
 			Title:        title,
 			Reason:       "Installed manifest catalog",
-			RefreshAfter: now.Add(time.Hour),
+			RefreshAfter: refreshAfter,
 			Items:        rowItems,
 		})
 	}
 
 	respondJSON(w, http.StatusOK, vortexoHomeFeed{
 		GeneratedAt:  now,
-		RefreshAfter: now.Add(time.Hour),
+		RefreshAfter: refreshAfter,
 		Rows:         rows,
 	})
 }
@@ -9135,6 +9717,16 @@ func maxTime(a time.Time, b time.Time) time.Time {
 		return b
 	}
 	return a
+}
+
+func minTime(a time.Time, b time.Time) time.Time {
+	if a.IsZero() {
+		return b
+	}
+	if b.IsZero() || a.Before(b) {
+		return a
+	}
+	return b
 }
 
 func firstNonZero(values ...int) int {

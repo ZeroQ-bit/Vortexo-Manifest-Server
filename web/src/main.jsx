@@ -128,6 +128,15 @@ function App() {
     sortBy: "TRENDING",
     rpdbKey: "",
   });
+  const [keywordRows, setKeywordRows] = useState({
+    enabled: false,
+    rowCount: 10,
+    tmdbKey: "",
+    tmdbToken: "",
+    language: "en-US",
+    region: "US",
+    clearCredentials: false,
+  });
   const [watchForm, setWatchForm] = useState({
     traktClientId: "",
     traktClientSecret: "",
@@ -175,6 +184,18 @@ function App() {
       url: dashboard.registry_url || current.url || DEFAULT_REGISTRY_URL,
     }));
   }, [dashboard.registry_url]);
+
+  useEffect(() => {
+    const config = dashboard.tmdb_keyword_rows;
+    if (!config) return;
+    setKeywordRows((current) => ({
+      ...current,
+      enabled: Boolean(config.enabled),
+      rowCount: config.row_count || current.rowCount || 10,
+      language: config.language || current.language || "en-US",
+      region: config.region || current.region || "US",
+    }));
+  }, [dashboard.tmdb_keyword_rows]);
 
   useEffect(() => {
     if (signedIn && view === "discover" && registryAddons.length === 0 && !registryLoading) {
@@ -533,6 +554,39 @@ function App() {
     }
   }
 
+  async function saveKeywordRows(event) {
+    event.preventDefault();
+    const hasSavedCredential = Boolean(dashboard.tmdb_keyword_rows?.has_api_key || dashboard.tmdb_keyword_rows?.has_access_token);
+    if (keywordRows.enabled && !keywordRows.tmdbKey.trim() && !keywordRows.tmdbToken.trim() && !hasSavedCredential) {
+      setMessage("Add a TMDB key or read access token first.");
+      return;
+    }
+    setBusy(true);
+    try {
+      await request("/api/v1/bridge/tmdb-keyword-rows", {
+        method: "POST",
+        body: JSON.stringify({
+          enabled: keywordRows.enabled,
+          row_count: Number(keywordRows.rowCount) || 10,
+          tmdb_api_key: keywordRows.tmdbKey.trim(),
+          tmdb_access_token: keywordRows.tmdbToken.trim(),
+          language: keywordRows.language.trim(),
+          region: keywordRows.region.trim(),
+          clear_credentials: keywordRows.clearCredentials,
+        }),
+      });
+      setKeywordRows((current) => ({ ...current, tmdbKey: "", tmdbToken: "", clearCredentials: false }));
+      setMessage(keywordRows.enabled ? "Random keyword rows saved" : "Random keyword rows disabled");
+      await loadDashboard();
+      await loadPublicHome();
+      setView("overview");
+    } catch (error) {
+      setMessage(error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function saveWatch(event) {
     event.preventDefault();
     setBusy(true);
@@ -832,8 +886,12 @@ function App() {
                 setPerfect={setPerfect}
                 streamingCatalogs={streamingCatalogs}
                 setStreamingCatalogs={setStreamingCatalogs}
+                keywordRows={keywordRows}
+                setKeywordRows={setKeywordRows}
+                keywordRowsStatus={dashboard.tmdb_keyword_rows || {}}
                 onSubmit={generatePerfectSetup}
                 onStreamingSubmit={installStreamingCatalogs}
+                onKeywordRowsSubmit={saveKeywordRows}
                 busy={busy}
               />
             )}
@@ -1237,7 +1295,19 @@ function LiveTV({ rows, summary }) {
   );
 }
 
-function Setup({ perfect, setPerfect, streamingCatalogs, setStreamingCatalogs, onSubmit, onStreamingSubmit, busy }) {
+function Setup({
+  perfect,
+  setPerfect,
+  streamingCatalogs,
+  setStreamingCatalogs,
+  keywordRows,
+  setKeywordRows,
+  keywordRowsStatus,
+  onSubmit,
+  onStreamingSubmit,
+  onKeywordRowsSubmit,
+  busy,
+}) {
   const streamingLayout = streamingCatalogs.mergeAll ? "all" : streamingCatalogs.mergeProviders ? "provider" : "separate";
   const setStreamingLayout = (layout) => setStreamingCatalogs({
     ...streamingCatalogs,
@@ -1330,6 +1400,87 @@ function Setup({ perfect, setPerfect, streamingCatalogs, setStreamingCatalogs, o
         </div>
         <div className="form-actions">
           <button type="submit" disabled={busy}>Install Streaming Catalogs</button>
+        </div>
+      </form>
+
+      <form className="panel" onSubmit={onKeywordRowsSubmit}>
+        <div className="section-head">
+          <div>
+            <p className="eyebrow">Native Home</p>
+            <h2>Random Keyword Rows</h2>
+          </div>
+          <Sparkles size={22} />
+        </div>
+        <div className="form-grid two">
+          <div className="choice-block">
+            <span>Status</span>
+            <div className="choice-grid single-choice-grid">
+              <label className={keywordRows.enabled ? "choice-chip selected" : "choice-chip"}>
+                <input
+                  type="checkbox"
+                  checked={keywordRows.enabled}
+                  onChange={() => setKeywordRows({ ...keywordRows, enabled: !keywordRows.enabled })}
+                />
+                Enable hourly rows
+              </label>
+            </div>
+          </div>
+          <SelectField
+            label="Row count"
+            value={String(keywordRows.rowCount)}
+            onChange={(value) => setKeywordRows({ ...keywordRows, rowCount: Number(value) })}
+            options={[
+              ["10", "10 Rows"],
+              ["20", "20 Rows"],
+              ["30", "30 Rows"],
+              ["40", "40 Rows"],
+              ["50", "50 Rows"],
+            ]}
+          />
+        </div>
+        <div className="form-grid two">
+          <TextField
+            label="TMDB key"
+            type="password"
+            value={keywordRows.tmdbKey}
+            onChange={(value) => setKeywordRows({ ...keywordRows, tmdbKey: value })}
+            placeholder={keywordRowsStatus.has_api_key ? "Saved" : "Required"}
+          />
+          <TextField
+            label="TMDB token"
+            type="password"
+            value={keywordRows.tmdbToken}
+            onChange={(value) => setKeywordRows({ ...keywordRows, tmdbToken: value })}
+            placeholder={keywordRowsStatus.has_access_token ? "Saved" : "Optional"}
+          />
+        </div>
+        <div className="form-grid three">
+          <TextField
+            label="Language"
+            value={keywordRows.language}
+            onChange={(value) => setKeywordRows({ ...keywordRows, language: value })}
+          />
+          <TextField
+            label="Region"
+            value={keywordRows.region}
+            onChange={(value) => setKeywordRows({ ...keywordRows, region: value })}
+          />
+          <div className="choice-block">
+            <span>Credentials</span>
+            <div className="choice-grid single-choice-grid">
+              <label className={keywordRows.clearCredentials ? "choice-chip selected" : "choice-chip"}>
+                <input
+                  type="checkbox"
+                  checked={keywordRows.clearCredentials}
+                  onChange={() => setKeywordRows({ ...keywordRows, clearCredentials: !keywordRows.clearCredentials })}
+                />
+                Clear saved keys
+              </label>
+            </div>
+          </div>
+        </div>
+        <div className="form-actions">
+          <button type="submit" disabled={busy}>Save Keyword Rows</button>
         </div>
       </form>
 
