@@ -30,6 +30,12 @@ const (
 	defaultUsername                 = "vortexo"
 	defaultPassword                 = "vortexo"
 	defaultRegistryURL              = "https://stremio-addons.net/api/manifest.json"
+	streamingCatalogAddonID         = "com.vortexo.streaming-catalogs"
+	streamingCatalogAddonName       = "Streaming Catalogs"
+	streamingCatalogAddonPath       = "/addons/streaming-catalogs"
+	streamingCatalogCacheTTL        = 6 * time.Hour
+	streamingCatalogJustWatchLimit  = 100
+	streamingCatalogJustWatchURL    = "https://apis.justwatch.com/graphql"
 	plexProduct                     = "Vortexo Manifest Server"
 	plexVersion                     = "1.0.0"
 	plexPlatform                    = "Go"
@@ -50,6 +56,7 @@ const (
 )
 
 var srtTimestampPattern = regexp.MustCompile(`(\d{2}:\d{2}:\d{2}),(\d{3})`)
+var justWatchPosterPattern = regexp.MustCompile(`/poster/([0-9]+)/`)
 
 type appState struct {
 	mu                       sync.RWMutex
@@ -59,6 +66,8 @@ type appState struct {
 	client                   *http.Client
 	manifest                 map[string]manifestCacheEntry
 	watchMeta                map[string]watchStateMetadataCacheEntry
+	streamingCatalogMu       sync.RWMutex
+	streamingCatalogs        map[string]streamingCatalogCacheEntry
 	plexArtworkMu            sync.RWMutex
 	plexArtwork              map[string]plexArtworkCacheRecord
 	plexArtworkSyncMu        sync.Mutex
@@ -115,6 +124,38 @@ type installedManifest struct {
 	Enabled   bool      `json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type streamingCatalogSetupRequest struct {
+	Install   bool     `json:"install"`
+	Providers []string `json:"providers"`
+	Types     []string `json:"types"`
+	RPDBKey   string   `json:"rpdb_key,omitempty"`
+}
+
+type streamingCatalogSetupResponse struct {
+	OK          bool              `json:"ok"`
+	ManifestURL string            `json:"manifest_url"`
+	Manifest    installedManifest `json:"manifest,omitempty"`
+}
+
+type streamingCatalogAddonConfig struct {
+	Providers []string `json:"providers"`
+	Types     []string `json:"types"`
+	RPDBKey   string   `json:"rpdb_key,omitempty"`
+}
+
+type streamingCatalogProvider struct {
+	ID        string
+	Name      string
+	Types     []string
+	Countries map[string]string
+	Languages map[string]string
+}
+
+type streamingCatalogCacheEntry struct {
+	items   []stremioMeta
+	expires time.Time
 }
 
 type catalogPreference struct {
@@ -308,6 +349,75 @@ type stremioMetaResponse struct {
 	Meta  stremioMeta   `json:"meta"`
 	Metas []stremioMeta `json:"metas"`
 	Items []stremioMeta `json:"items"`
+}
+
+type justWatchPopularTitlesResponse struct {
+	Data struct {
+		PopularTitles struct {
+			Edges []struct {
+				Node struct {
+					Content struct {
+						Title       string `json:"title"`
+						PosterURL   string `json:"posterUrl"`
+						ExternalIDs struct {
+							IMDBID string `json:"imdbId"`
+						} `json:"externalIds"`
+						Scoring struct {
+							IMDBScore any `json:"imdbScore"`
+						} `json:"scoring"`
+					} `json:"content"`
+				} `json:"node"`
+			} `json:"edges"`
+		} `json:"popularTitles"`
+	} `json:"data"`
+}
+
+var streamingCatalogDefaultProviders = []string{"nfx", "dnp", "amp", "atp", "hbm"}
+var streamingCatalogDefaultTypes = []string{"movie", "series"}
+var streamingCatalogProviderOrder = []string{
+	"nfx", "nfk", "dnp", "amp", "atp", "hbm", "pmp", "hlu", "pcp", "cru",
+	"jhs", "zee", "vil", "nlz", "sst", "clv", "gop", "hay", "mgl", "cts",
+	"cpd", "stz", "dpe", "mbi", "vik", "sgo", "sonyliv", "mp9", "shd", "bbo",
+	"act", "itv", "bbc", "al4", "crc", "iqi", "sha",
+}
+var streamingCatalogProviders = map[string]streamingCatalogProvider{
+	"nfx":     {ID: "nfx", Name: "Netflix", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "GB", "series": "GB"}},
+	"nfk":     {ID: "nfk", Name: "Netflix Kids", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "US", "series": "US"}},
+	"dnp":     {ID: "dnp", Name: "Disney+", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "GB", "series": "GB"}},
+	"amp":     {ID: "amp", Name: "Prime Video", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "US", "series": "US"}},
+	"atp":     {ID: "atp", Name: "Apple TV+", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "GB", "series": "GB"}},
+	"hbm":     {ID: "hbm", Name: "HBO Max", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "NL", "series": "NL"}},
+	"pmp":     {ID: "pmp", Name: "Paramount+", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "US", "series": "US"}},
+	"hlu":     {ID: "hlu", Name: "Hulu", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "US", "series": "US"}},
+	"pcp":     {ID: "pcp", Name: "Peacock", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "US", "series": "US"}},
+	"cru":     {ID: "cru", Name: "Crunchyroll", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "US", "series": "US"}},
+	"jhs":     {ID: "jhs", Name: "JioHotstar", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "IN", "series": "IN"}, Languages: map[string]string{"movie": "in", "series": "in"}},
+	"zee":     {ID: "zee", Name: "Zee5", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "IN", "series": "IN"}, Languages: map[string]string{"movie": "in", "series": "in"}},
+	"vil":     {ID: "vil", Name: "Videoland", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "NL", "series": "NL"}, Languages: map[string]string{"movie": "nl", "series": "nl"}},
+	"nlz":     {ID: "nlz", Name: "NLZIET", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "NL", "series": "NL"}, Languages: map[string]string{"movie": "nl", "series": "nl"}},
+	"sst":     {ID: "sst", Name: "SkyShowtime", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "NL", "series": "NL"}, Languages: map[string]string{"movie": "nl", "series": "nl"}},
+	"clv":     {ID: "clv", Name: "Clarovideo", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "BR", "series": "BR"}, Languages: map[string]string{"movie": "br", "series": "br"}},
+	"gop":     {ID: "gop", Name: "Globoplay", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "BR", "series": "BR"}, Languages: map[string]string{"movie": "br", "series": "br"}},
+	"hay":     {ID: "hay", Name: "Hayu", Types: []string{"series"}, Countries: map[string]string{"series": "GB"}},
+	"mgl":     {ID: "mgl", Name: "MagellanTV", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "US", "series": "US"}},
+	"cts":     {ID: "cts", Name: "Curiosity Stream", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "US", "series": "US"}},
+	"cpd":     {ID: "cpd", Name: "Canal+", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "FR", "series": "FR"}, Languages: map[string]string{"movie": "fr", "series": "fr"}},
+	"stz":     {ID: "stz", Name: "Starz", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "US", "series": "US"}},
+	"dpe":     {ID: "dpe", Name: "Discovery+", Types: []string{"series"}, Countries: map[string]string{"series": "GB"}},
+	"mbi":     {ID: "mbi", Name: "Mubi", Types: []string{"movie"}, Countries: map[string]string{"movie": "US"}},
+	"vik":     {ID: "vik", Name: "Rakuten Viki", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "US", "series": "US"}},
+	"sgo":     {ID: "sgo", Name: "Sky Go", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "DE", "series": "DE"}, Languages: map[string]string{"movie": "de", "series": "de"}},
+	"sonyliv": {ID: "sonyliv", Name: "Sony Liv", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "IN", "series": "IN"}, Languages: map[string]string{"movie": "hi", "series": "hi"}},
+	"mp9":     {ID: "mp9", Name: "Movistar+", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "ES", "series": "ES"}, Languages: map[string]string{"movie": "es", "series": "es"}},
+	"shd":     {ID: "shd", Name: "Shudder", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "US", "series": "US"}},
+	"bbo":     {ID: "bbo", Name: "BritBox", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "US", "series": "US"}},
+	"act":     {ID: "act", Name: "Acorn TV", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "US", "series": "US"}},
+	"itv":     {ID: "itv", Name: "ITVX", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "GB", "series": "GB"}},
+	"bbc":     {ID: "bbc", Name: "BBC iPlayer", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "GB", "series": "GB"}},
+	"al4":     {ID: "al4", Name: "Channel 4", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "GB", "series": "GB"}},
+	"crc":     {ID: "crc", Name: "Criterion Channel", Types: []string{"movie"}, Countries: map[string]string{"movie": "US"}},
+	"iqi":     {ID: "iqi", Name: "iQIYI", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "US", "series": "US"}},
+	"sha":     {ID: "sha", Name: "Shahid VIP", Types: []string{"movie", "series"}, Countries: map[string]string{"movie": "US", "series": "US"}},
 }
 
 type stremioMeta struct {
@@ -1014,11 +1124,12 @@ func run() error {
 	}
 
 	state := &appState{
-		dataDir:     dataDir,
-		client:      &http.Client{Timeout: 20 * time.Second},
-		manifest:    map[string]manifestCacheEntry{},
-		watchMeta:   map[string]watchStateMetadataCacheEntry{},
-		plexArtwork: map[string]plexArtworkCacheRecord{},
+		dataDir:           dataDir,
+		client:            &http.Client{Timeout: 20 * time.Second},
+		manifest:          map[string]manifestCacheEntry{},
+		watchMeta:         map[string]watchStateMetadataCacheEntry{},
+		streamingCatalogs: map[string]streamingCatalogCacheEntry{},
+		plexArtwork:       map[string]plexArtworkCacheRecord{},
 	}
 	if err := state.load(); err != nil {
 		return err
@@ -1052,6 +1163,7 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/bridge/dashboard", s.requireAuth(s.handleBridgeDashboard))
 	mux.HandleFunc("/api/v1/bridge/addon-registry", s.requireAuth(s.handleAddonRegistry))
 	mux.HandleFunc("/api/v1/bridge/catalogs", s.requireAuth(s.handleCatalogPreferences))
+	mux.HandleFunc("/api/v1/bridge/streaming-catalogs", s.requireAuth(s.handleStreamingCatalogsSetup))
 	mux.HandleFunc("/api/v1/bridge/perfect-setup", s.requireAuth(s.handlePerfectSetup))
 	mux.HandleFunc("/api/v1/bridge/manifests", s.requireAuth(s.handleManifests))
 	mux.HandleFunc("/api/v1/bridge/manifests/", s.requireAuth(s.handleManifestByID))
@@ -1087,6 +1199,7 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/vortexo/sources", s.handleVortexoSources)
 	mux.HandleFunc("/api/v1/vortexo/play/", s.handleVortexoPlay)
 	mux.HandleFunc("/api/v1/vortexo/subtitles/", s.handleVortexoSubtitles)
+	mux.HandleFunc(streamingCatalogAddonPath+"/", s.handleStreamingCatalogsAddon)
 	mux.HandleFunc("/player_api.php", s.handleXtreamPlayerAPI)
 	mux.HandleFunc("/xmltv.php", s.handleXMLTV)
 	mux.HandleFunc("/live/", s.handleLivePlayback)
@@ -2312,6 +2425,535 @@ func (s *appState) handleCatalogPreferences(w http.ResponseWriter, r *http.Reque
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
 }
+
+func (s *appState) handleStreamingCatalogsSetup(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		respondJSON(w, http.StatusOK, map[string]any{
+			"providers":         streamingCatalogDashboardProviders(),
+			"default_providers": streamingCatalogDefaultProviders,
+			"default_types":     streamingCatalogDefaultTypes,
+		})
+	case http.MethodPost:
+		var req streamingCatalogSetupRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			respondError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		config := normalizeStreamingCatalogConfig(streamingCatalogAddonConfig{
+			Providers: req.Providers,
+			Types:     req.Types,
+			RPDBKey:   req.RPDBKey,
+		})
+		manifestURL := streamingCatalogManifestURL(requestPublicBaseURL(r), config)
+		response := streamingCatalogSetupResponse{
+			OK:          true,
+			ManifestURL: manifestURL,
+		}
+		if req.Install {
+			manifest, err := s.installManifest(r.Context(), installedManifest{
+				ID:      "vortexo-streaming-catalogs",
+				Name:    streamingCatalogAddonName,
+				URL:     manifestURL,
+				Enabled: true,
+			})
+			if err != nil {
+				respondError(w, http.StatusBadGateway, err.Error())
+				return
+			}
+			response.Manifest = manifest
+		}
+		respondJSON(w, http.StatusOK, response)
+	default:
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *appState) handleStreamingCatalogsAddon(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	tail := strings.Trim(strings.TrimPrefix(r.URL.Path, streamingCatalogAddonPath), "/")
+	if tail == "" || tail == "manifest.json" {
+		s.handleStreamingCatalogsManifest(w, defaultStreamingCatalogConfig())
+		return
+	}
+
+	parts := strings.Split(tail, "/")
+	if len(parts) == 2 && parts[1] == "manifest.json" {
+		config, err := decodeStreamingCatalogConfig(parts[0])
+		if err != nil {
+			respondError(w, http.StatusBadRequest, "invalid streaming catalogs configuration")
+			return
+		}
+		s.handleStreamingCatalogsManifest(w, config)
+		return
+	}
+
+	if len(parts) >= 4 && parts[1] == "catalog" {
+		config, err := decodeStreamingCatalogConfig(parts[0])
+		if err != nil {
+			respondError(w, http.StatusBadRequest, "invalid streaming catalogs configuration")
+			return
+		}
+		catalogType := normalizeStremioType(parts[2])
+		catalogID := strings.TrimSuffix(parts[3], ".json")
+		if catalogType == "" || catalogID == "" {
+			respondError(w, http.StatusBadRequest, "invalid streaming catalog request")
+			return
+		}
+		s.handleStreamingCatalogsCatalog(w, r, config, catalogType, catalogID)
+		return
+	}
+
+	respondError(w, http.StatusNotFound, "streaming catalogs route not found")
+}
+
+func (s *appState) handleStreamingCatalogsManifest(w http.ResponseWriter, config streamingCatalogAddonConfig) {
+	respondJSON(w, http.StatusOK, streamingCatalogManifest(config))
+}
+
+func (s *appState) handleStreamingCatalogsCatalog(w http.ResponseWriter, r *http.Request, config streamingCatalogAddonConfig, catalogType string, providerID string) {
+	if !streamingCatalogConfigIncludes(config, catalogType, providerID) {
+		respondJSON(w, http.StatusOK, map[string]any{"metas": []stremioMeta{}})
+		return
+	}
+	items, err := s.streamingCatalogMetas(r.Context(), catalogType, providerID)
+	if err != nil {
+		log.Printf("streaming catalog %s/%s failed: %v", catalogType, providerID, err)
+		respondJSON(w, http.StatusOK, map[string]any{"metas": []stremioMeta{}})
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"metas": applyStreamingCatalogRPDB(config.RPDBKey, items)})
+}
+
+func streamingCatalogDashboardProviders() []map[string]any {
+	providers := make([]map[string]any, 0, len(streamingCatalogProviderOrder))
+	for _, id := range streamingCatalogProviderOrder {
+		provider, ok := streamingCatalogProviders[id]
+		if !ok {
+			continue
+		}
+		providers = append(providers, map[string]any{
+			"id":    provider.ID,
+			"name":  provider.Name,
+			"types": provider.Types,
+		})
+	}
+	return providers
+}
+
+func streamingCatalogManifest(config streamingCatalogAddonConfig) stremioManifest {
+	config = normalizeStreamingCatalogConfig(config)
+	return stremioManifest{
+		ID:          streamingCatalogAddonID,
+		Name:        streamingCatalogAddonName,
+		Description: "Trending movie and series rows from Netflix, Disney+, HBO Max, Prime Video, Apple TV+, and more.",
+		Version:     "1.0.0",
+		Logo:        "https://play-lh.googleusercontent.com/TBRwjS_qfJCSj1m7zZB93FnpJM5fSpMA_wUlFDLxWAb45T9RmwBvQd5cWR5viJJOhkI",
+		Resources:   []any{"catalog"},
+		Types:       append([]string(nil), config.Types...),
+		Catalogs:    streamingCatalogRows(config),
+		BehaviorHints: map[string]any{
+			"configurable": false,
+		},
+	}
+}
+
+func streamingCatalogRows(config streamingCatalogAddonConfig) []stremioCatalog {
+	config = normalizeStreamingCatalogConfig(config)
+	typeSet := map[string]bool{}
+	for _, catalogType := range config.Types {
+		typeSet[catalogType] = true
+	}
+	rows := make([]stremioCatalog, 0, len(config.Providers)*len(config.Types))
+	for _, providerID := range config.Providers {
+		provider, ok := streamingCatalogProviders[providerID]
+		if !ok {
+			continue
+		}
+		for _, catalogType := range config.Types {
+			if !typeSet[catalogType] || !streamingProviderSupportsType(provider, catalogType) {
+				continue
+			}
+			rows = append(rows, stremioCatalog{
+				ID:   provider.ID,
+				Type: catalogType,
+				Name: provider.Name,
+			})
+		}
+	}
+	return rows
+}
+
+func streamingCatalogConfigIncludes(config streamingCatalogAddonConfig, catalogType string, providerID string) bool {
+	config = normalizeStreamingCatalogConfig(config)
+	providerID = canonicalStreamingProviderID(providerID)
+	provider, ok := streamingCatalogProviders[providerID]
+	if !ok || !streamingProviderSupportsType(provider, catalogType) {
+		return false
+	}
+	providerEnabled := false
+	for _, id := range config.Providers {
+		if id == providerID {
+			providerEnabled = true
+			break
+		}
+	}
+	if !providerEnabled {
+		return false
+	}
+	for _, enabledType := range config.Types {
+		if enabledType == catalogType {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeStreamingCatalogConfig(config streamingCatalogAddonConfig) streamingCatalogAddonConfig {
+	config.Providers = normalizeStreamingCatalogProviders(config.Providers)
+	config.Types = normalizeStreamingCatalogTypes(config.Types)
+	config.RPDBKey = strings.TrimSpace(config.RPDBKey)
+	return config
+}
+
+func defaultStreamingCatalogConfig() streamingCatalogAddonConfig {
+	return normalizeStreamingCatalogConfig(streamingCatalogAddonConfig{
+		Providers: append([]string(nil), streamingCatalogDefaultProviders...),
+		Types:     append([]string(nil), streamingCatalogDefaultTypes...),
+	})
+}
+
+func normalizeStreamingCatalogProviders(providerIDs []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(providerIDs))
+	for _, raw := range providerIDs {
+		id := canonicalStreamingProviderID(raw)
+		if id == "" || seen[id] {
+			continue
+		}
+		if _, ok := streamingCatalogProviders[id]; !ok {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	if len(out) > 0 {
+		return out
+	}
+	return append([]string(nil), streamingCatalogDefaultProviders...)
+}
+
+func normalizeStreamingCatalogTypes(types []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(types))
+	for _, raw := range types {
+		catalogType := normalizeStremioType(raw)
+		if catalogType == "" || seen[catalogType] {
+			continue
+		}
+		seen[catalogType] = true
+		out = append(out, catalogType)
+	}
+	if len(out) > 0 {
+		return out
+	}
+	return append([]string(nil), streamingCatalogDefaultTypes...)
+}
+
+func canonicalStreamingProviderID(providerID string) string {
+	switch strings.ToLower(strings.TrimSpace(providerID)) {
+	case "pct":
+		return "pcp"
+	case "fmn":
+		return "cru"
+	case "hst":
+		return "jhs"
+	default:
+		return strings.ToLower(strings.TrimSpace(providerID))
+	}
+}
+
+func streamingProviderSupportsType(provider streamingCatalogProvider, catalogType string) bool {
+	for _, supported := range provider.Types {
+		if supported == catalogType {
+			return true
+		}
+	}
+	return false
+}
+
+func streamingCatalogManifestURL(baseURL string, config streamingCatalogAddonConfig) string {
+	config = normalizeStreamingCatalogConfig(config)
+	data, _ := json.Marshal(config)
+	encoded := base64.RawURLEncoding.EncodeToString(data)
+	return strings.TrimRight(baseURL, "/") + streamingCatalogAddonPath + "/" + encoded + "/manifest.json"
+}
+
+func decodeStreamingCatalogConfig(encoded string) (streamingCatalogAddonConfig, error) {
+	encoded = strings.TrimSpace(encoded)
+	if encoded == "" {
+		return defaultStreamingCatalogConfig(), nil
+	}
+	data, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return streamingCatalogAddonConfig{}, err
+	}
+	var config streamingCatalogAddonConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return streamingCatalogAddonConfig{}, err
+	}
+	return normalizeStreamingCatalogConfig(config), nil
+}
+
+func requestPublicBaseURL(r *http.Request) string {
+	proto := firstForwardedValue(r.Header.Get("X-Forwarded-Proto"))
+	if proto == "" {
+		if r.TLS != nil {
+			proto = "https"
+		} else {
+			proto = "http"
+		}
+	}
+	host := firstForwardedValue(r.Header.Get("X-Forwarded-Host"))
+	if host == "" {
+		host = r.Host
+	}
+	return proto + "://" + host
+}
+
+func firstForwardedValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if idx := strings.Index(value, ","); idx >= 0 {
+		value = value[:idx]
+	}
+	return strings.TrimSpace(value)
+}
+
+func (s *appState) streamingCatalogMetas(ctx context.Context, catalogType string, providerID string) ([]stremioMeta, error) {
+	providerID = canonicalStreamingProviderID(providerID)
+	provider, ok := streamingCatalogProviders[providerID]
+	if !ok || !streamingProviderSupportsType(provider, catalogType) {
+		return nil, fmt.Errorf("unsupported streaming catalog %s/%s", catalogType, providerID)
+	}
+	country := firstNonEmpty(provider.Countries[catalogType], "US")
+	language := firstNonEmpty(provider.Languages[catalogType], "en")
+	cacheKey := strings.Join([]string{catalogType, providerID, country, language}, ":")
+	now := time.Now()
+
+	s.streamingCatalogMu.RLock()
+	cached, ok := s.streamingCatalogs[cacheKey]
+	s.streamingCatalogMu.RUnlock()
+	if ok && now.Before(cached.expires) {
+		return append([]stremioMeta(nil), cached.items...), nil
+	}
+
+	items, err := s.fetchJustWatchStreamingCatalog(ctx, provider, catalogType, country, language)
+	if err != nil {
+		return nil, err
+	}
+	s.streamingCatalogMu.Lock()
+	s.streamingCatalogs[cacheKey] = streamingCatalogCacheEntry{
+		items:   append([]stremioMeta(nil), items...),
+		expires: now.Add(streamingCatalogCacheTTL),
+	}
+	s.streamingCatalogMu.Unlock()
+	return items, nil
+}
+
+func (s *appState) fetchJustWatchStreamingCatalog(ctx context.Context, provider streamingCatalogProvider, catalogType string, country string, language string) ([]stremioMeta, error) {
+	objectType := "MOVIE"
+	if catalogType == "series" {
+		objectType = "SHOW"
+	}
+	payload := map[string]any{
+		"operationName": "GetPopularTitles",
+		"variables": map[string]any{
+			"popularTitlesSortBy": "TRENDING",
+			"first":               streamingCatalogJustWatchLimit,
+			"platform":            "WEB",
+			"sortRandomSeed":      0,
+			"popularAfterCursor":  "",
+			"offset":              nil,
+			"popularTitlesFilter": map[string]any{
+				"ageCertifications":          []string{},
+				"excludeGenres":              []string{},
+				"excludeProductionCountries": []string{},
+				"genres":                     []string{},
+				"objectTypes":                []string{objectType},
+				"productionCountries":        []string{},
+				"packages":                   []string{provider.ID},
+				"excludeIrrelevantTitles":    false,
+				"presentationTypes":          []string{},
+				"monetizationTypes":          []string{},
+			},
+			"language": language,
+			"country":  country,
+		},
+		"query": streamingCatalogJustWatchQuery,
+	}
+
+	var response justWatchPopularTitlesResponse
+	if err := s.postJSON(ctx, streamingCatalogJustWatchURL, payload, &response); err != nil {
+		return nil, err
+	}
+
+	seen := map[string]bool{}
+	items := make([]stremioMeta, 0, len(response.Data.PopularTitles.Edges))
+	for _, edge := range response.Data.PopularTitles.Edges {
+		content := edge.Node.Content
+		imdbID := imdbFromID(content.ExternalIDs.IMDBID)
+		title := strings.TrimSpace(content.Title)
+		if imdbID == "" || title == "" || seen[imdbID] {
+			continue
+		}
+		seen[imdbID] = true
+		items = append(items, stremioMeta{
+			ID:          imdbID,
+			Type:        catalogType,
+			Name:        title,
+			Title:       title,
+			IMDBID:      imdbID,
+			Poster:      justWatchStreamingPosterURL(content.PosterURL, imdbID),
+			PosterShape: "poster",
+			IMDBRating:  justWatchScoreText(content.Scoring.IMDBScore),
+		})
+	}
+	return items, nil
+}
+
+func justWatchStreamingPosterURL(raw string, imdbID string) string {
+	if match := justWatchPosterPattern.FindStringSubmatch(raw); len(match) == 2 {
+		return "https://images.justwatch.com/poster/" + match[1] + "/s332/img"
+	}
+	if imdbID != "" {
+		return "https://live.metahub.space/poster/medium/" + imdbID + "/img"
+	}
+	return ""
+}
+
+func justWatchScoreText(value any) string {
+	switch score := value.(type) {
+	case float64:
+		if score > 0 {
+			return strconv.FormatFloat(score, 'f', 1, 64)
+		}
+	case string:
+		return strings.TrimSpace(score)
+	}
+	return ""
+}
+
+func applyStreamingCatalogRPDB(rpdbKey string, items []stremioMeta) []stremioMeta {
+	rpdbKey = strings.TrimSpace(rpdbKey)
+	if rpdbKey == "" {
+		return append([]stremioMeta(nil), items...)
+	}
+	out := make([]stremioMeta, 0, len(items))
+	for _, item := range items {
+		clone := item
+		if imdbID := imdbFromID(firstNonEmpty(clone.IMDBID, clone.ID)); imdbID != "" {
+			clone.Poster = "https://api.ratingposterdb.com/" + url.PathEscape(rpdbKey) + "/imdb/poster-default/" + imdbID + ".jpg"
+		}
+		out = append(out, clone)
+	}
+	return out
+}
+
+func (s *appState) getLocalStreamingCatalogJSON(ctx context.Context, rawURL string, target any) (bool, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || !strings.HasPrefix(parsed.Path, streamingCatalogAddonPath+"/") {
+		return false, nil
+	}
+	value, err := s.localStreamingCatalogValue(ctx, parsed.Path)
+	if err != nil {
+		return true, err
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return true, err
+	}
+	return true, json.Unmarshal(data, target)
+}
+
+func (s *appState) localStreamingCatalogValue(ctx context.Context, path string) (any, error) {
+	tail := strings.Trim(strings.TrimPrefix(path, streamingCatalogAddonPath), "/")
+	if tail == "" || tail == "manifest.json" {
+		return streamingCatalogManifest(defaultStreamingCatalogConfig()), nil
+	}
+	parts := strings.Split(tail, "/")
+	if len(parts) == 2 && parts[1] == "manifest.json" {
+		config, err := decodeStreamingCatalogConfig(parts[0])
+		if err != nil {
+			return nil, err
+		}
+		return streamingCatalogManifest(config), nil
+	}
+	if len(parts) >= 4 && parts[1] == "catalog" {
+		config, err := decodeStreamingCatalogConfig(parts[0])
+		if err != nil {
+			return nil, err
+		}
+		catalogType := normalizeStremioType(parts[2])
+		providerID := strings.TrimSuffix(parts[3], ".json")
+		if catalogType == "" || providerID == "" {
+			return nil, fmt.Errorf("invalid streaming catalog path")
+		}
+		if !streamingCatalogConfigIncludes(config, catalogType, providerID) {
+			return map[string]any{"metas": []stremioMeta{}}, nil
+		}
+		items, err := s.streamingCatalogMetas(ctx, catalogType, providerID)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"metas": applyStreamingCatalogRPDB(config.RPDBKey, items)}, nil
+	}
+	return nil, fmt.Errorf("streaming catalogs route not found")
+}
+
+const streamingCatalogJustWatchQuery = `query GetPopularTitles(
+  $country: Country!
+  $popularTitlesFilter: TitleFilter
+  $popularAfterCursor: String
+  $popularTitlesSortBy: PopularTitlesSorting! = POPULAR
+  $first: Int!
+  $language: Language!
+  $offset: Int = 0
+  $sortRandomSeed: Int! = 0
+  $profile: PosterProfile
+  $format: ImageFormat
+) {
+  popularTitles(
+    country: $country
+    filter: $popularTitlesFilter
+    offset: $offset
+    after: $popularAfterCursor
+    sortBy: $popularTitlesSortBy
+    first: $first
+    sortRandomSeed: $sortRandomSeed
+  ) {
+    edges {
+      node {
+        content(country: $country, language: $language) {
+          externalIds {
+            imdbId
+          }
+          title
+          scoring {
+            imdbScore
+          }
+          posterUrl(profile: $profile, format: $format)
+        }
+      }
+    }
+  }
+}`
 
 func (s *appState) handlePerfectSetup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -4482,6 +5124,10 @@ func (s *appState) fetchSubtitleBody(ctx context.Context, rawURL string) ([]byte
 }
 
 func (s *appState) getJSON(ctx context.Context, rawURL string, target any) error {
+	if handled, err := s.getLocalStreamingCatalogJSON(ctx, rawURL, target); handled {
+		return err
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return err

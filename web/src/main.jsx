@@ -29,6 +29,33 @@ import {
 import "./styles.css";
 
 const DEFAULT_REGISTRY_URL = "https://stremio-addons.net/api/manifest.json";
+const STREAMING_CATALOG_PROVIDERS = [
+  ["nfx", "Netflix"],
+  ["hbm", "HBO Max"],
+  ["dnp", "Disney+"],
+  ["amp", "Prime Video"],
+  ["atp", "Apple TV+"],
+  ["pmp", "Paramount+"],
+  ["pcp", "Peacock"],
+  ["hlu", "Hulu"],
+  ["nfk", "Netflix Kids"],
+  ["cru", "Crunchyroll"],
+  ["jhs", "JioHotstar"],
+  ["zee", "Zee5"],
+  ["mgl", "MagellanTV"],
+  ["cts", "Curiosity Stream"],
+  ["mbi", "Mubi"],
+  ["shd", "Shudder"],
+  ["bbo", "BritBox"],
+  ["act", "Acorn TV"],
+  ["itv", "ITVX"],
+  ["bbc", "BBC iPlayer"],
+  ["al4", "Channel 4"],
+];
+const STREAMING_CATALOG_TYPES = [
+  ["movie", "Movies"],
+  ["series", "Shows"],
+];
 
 const NAV = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
@@ -87,6 +114,11 @@ function App() {
     geminiKey: "",
     rpdbKey: "",
     language: "English",
+  });
+  const [streamingCatalogs, setStreamingCatalogs] = useState({
+    providers: ["nfx", "dnp", "amp", "atp", "hbm"],
+    types: ["movie", "series"],
+    rpdbKey: "",
   });
   const [watchForm, setWatchForm] = useState({
     traktClientId: "",
@@ -457,6 +489,39 @@ function App() {
     }
   }
 
+  async function installStreamingCatalogs(event) {
+    event.preventDefault();
+    if (streamingCatalogs.providers.length === 0) {
+      setMessage("Choose at least one streaming provider.");
+      return;
+    }
+    if (streamingCatalogs.types.length === 0) {
+      setMessage("Choose at least one catalog row type.");
+      return;
+    }
+    setBusy(true);
+    try {
+      await request("/api/v1/bridge/streaming-catalogs", {
+        method: "POST",
+        body: JSON.stringify({
+          install: true,
+          providers: streamingCatalogs.providers,
+          types: streamingCatalogs.types,
+          rpdb_key: streamingCatalogs.rpdbKey.trim(),
+        }),
+      });
+      setMessage("Streaming Catalogs installed");
+      await loadDashboard();
+      await loadPublicHome();
+      await loadLiveRows();
+      setView("catalogs");
+    } catch (error) {
+      setMessage(error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function saveWatch(event) {
     event.preventDefault();
     setBusy(true);
@@ -751,7 +816,15 @@ function App() {
             )}
             {view === "live" && <LiveTV rows={liveRows} summary={summary} />}
             {view === "setup" && (
-              <Setup perfect={perfect} setPerfect={setPerfect} onSubmit={generatePerfectSetup} busy={busy} />
+              <Setup
+                perfect={perfect}
+                setPerfect={setPerfect}
+                streamingCatalogs={streamingCatalogs}
+                setStreamingCatalogs={setStreamingCatalogs}
+                onSubmit={generatePerfectSetup}
+                onStreamingSubmit={installStreamingCatalogs}
+                busy={busy}
+              />
             )}
             {view === "watch" && (
               <WatchSync
@@ -1153,54 +1226,113 @@ function LiveTV({ rows, summary }) {
   );
 }
 
-function Setup({ perfect, setPerfect, onSubmit, busy }) {
+function Setup({ perfect, setPerfect, streamingCatalogs, setStreamingCatalogs, onSubmit, onStreamingSubmit, busy }) {
   return (
-    <form className="panel" onSubmit={onSubmit}>
-      <div className="section-head">
-        <div>
-          <p className="eyebrow">Guided install</p>
-          <h2>Generate a clean setup</h2>
+    <section className="stack">
+      <form className="panel" onSubmit={onStreamingSubmit}>
+        <div className="section-head">
+          <div>
+            <p className="eyebrow">Built-in catalogs</p>
+            <h2>Streaming Catalogs</h2>
+          </div>
+          <Clapperboard size={22} />
         </div>
-        <ShieldCheck size={22} />
-      </div>
-      <div className="form-grid three">
-        <SelectField label="Debrid provider" value={perfect.debridProvider} onChange={(value) => setPerfect({ ...perfect, debridProvider: value })} options={[
-          ["none", "None / P2P only"],
-          ["realdebrid", "Real-Debrid"],
-          ["torbox", "TorBox"],
-          ["premiumize", "Premiumize"],
-          ["alldebrid", "AllDebrid"],
-          ["debridlink", "Debrid-Link"],
-          ["easydebrid", "EasyDebrid"],
-        ]} />
-        <TextField label="Debrid API key" type="password" value={perfect.debridKey} onChange={(value) => setPerfect({ ...perfect, debridKey: value })} />
-        <SelectField label="Language" value={perfect.language} onChange={(value) => setPerfect({ ...perfect, language: value })} options={[
-          ["English", "English"],
-          ["Croatian", "Croatian"],
-          ["Arabic", "Arabic"],
-          ["French", "French"],
-          ["German", "German"],
-          ["Spanish", "Spanish"],
-        ]} />
-        <SelectField label="AIOStreams" value={perfect.aiostreams} onChange={(value) => setPerfect({ ...perfect, aiostreams: value })} options={[
-          ["https://aiostreams.fortheweak.cloud", "Fortheweak"],
-          ["https://aiostreamsfortheweebsstable.midnightignite.me", "Midnight"],
-          ["https://aiostreams.viren070.me", "Viren"],
-        ]} />
-        <SelectField label="AIOMetadata" value={perfect.aiometadata} onChange={(value) => setPerfect({ ...perfect, aiometadata: value })} options={[
-          ["https://aiometadata.viren070.me", "Viren"],
-          ["https://aiometadatafortheweebs.midnightignite.me", "Midnight"],
-        ]} />
-        <TextField label="RPDB key" value={perfect.rpdbKey} onChange={(value) => setPerfect({ ...perfect, rpdbKey: value })} />
-        <TextField label="TMDB key" type="password" value={perfect.tmdbKey} onChange={(value) => setPerfect({ ...perfect, tmdbKey: value })} />
-        <TextField label="TMDB token" type="password" value={perfect.tmdbToken} onChange={(value) => setPerfect({ ...perfect, tmdbToken: value })} />
-        <TextField label="TVDB key" type="password" value={perfect.tvdbKey} onChange={(value) => setPerfect({ ...perfect, tvdbKey: value })} />
-        <TextField label="Gemini key" type="password" value={perfect.geminiKey} onChange={(value) => setPerfect({ ...perfect, geminiKey: value })} />
-      </div>
-      <div className="form-actions">
-        <button type="submit" disabled={busy}>Generate and install</button>
-      </div>
-    </form>
+        <div className="choice-block">
+          <span>Providers</span>
+          <div className="choice-grid">
+            {STREAMING_CATALOG_PROVIDERS.map(([id, label]) => (
+              <label className={streamingCatalogs.providers.includes(id) ? "choice-chip selected" : "choice-chip"} key={id}>
+                <input
+                  type="checkbox"
+                  checked={streamingCatalogs.providers.includes(id)}
+                  onChange={() => setStreamingCatalogs({
+                    ...streamingCatalogs,
+                    providers: toggleArrayValue(streamingCatalogs.providers, id),
+                  })}
+                />
+                {label}
+              </label>
+            ))}
+          </div>
+        </div>
+        <div className="form-grid two">
+          <div className="choice-block">
+            <span>Rows</span>
+            <div className="choice-grid compact-choice-grid">
+              {STREAMING_CATALOG_TYPES.map(([id, label]) => (
+                <label className={streamingCatalogs.types.includes(id) ? "choice-chip selected" : "choice-chip"} key={id}>
+                  <input
+                    type="checkbox"
+                    checked={streamingCatalogs.types.includes(id)}
+                    onChange={() => setStreamingCatalogs({
+                      ...streamingCatalogs,
+                      types: toggleArrayValue(streamingCatalogs.types, id),
+                    })}
+                  />
+                  {label}
+                </label>
+              ))}
+            </div>
+          </div>
+          <TextField
+            label="RPDB key"
+            value={streamingCatalogs.rpdbKey}
+            onChange={(value) => setStreamingCatalogs({ ...streamingCatalogs, rpdbKey: value })}
+            placeholder="Optional"
+          />
+        </div>
+        <div className="form-actions">
+          <button type="submit" disabled={busy}>Install Streaming Catalogs</button>
+        </div>
+      </form>
+
+      <form className="panel" onSubmit={onSubmit}>
+        <div className="section-head">
+          <div>
+            <p className="eyebrow">Guided install</p>
+            <h2>Generate a clean setup</h2>
+          </div>
+          <ShieldCheck size={22} />
+        </div>
+        <div className="form-grid three">
+          <SelectField label="Debrid provider" value={perfect.debridProvider} onChange={(value) => setPerfect({ ...perfect, debridProvider: value })} options={[
+            ["none", "None / P2P only"],
+            ["realdebrid", "Real-Debrid"],
+            ["torbox", "TorBox"],
+            ["premiumize", "Premiumize"],
+            ["alldebrid", "AllDebrid"],
+            ["debridlink", "Debrid-Link"],
+            ["easydebrid", "EasyDebrid"],
+          ]} />
+          <TextField label="Debrid API key" type="password" value={perfect.debridKey} onChange={(value) => setPerfect({ ...perfect, debridKey: value })} />
+          <SelectField label="Language" value={perfect.language} onChange={(value) => setPerfect({ ...perfect, language: value })} options={[
+            ["English", "English"],
+            ["Croatian", "Croatian"],
+            ["Arabic", "Arabic"],
+            ["French", "French"],
+            ["German", "German"],
+            ["Spanish", "Spanish"],
+          ]} />
+          <SelectField label="AIOStreams" value={perfect.aiostreams} onChange={(value) => setPerfect({ ...perfect, aiostreams: value })} options={[
+            ["https://aiostreams.fortheweak.cloud", "Fortheweak"],
+            ["https://aiostreamsfortheweebsstable.midnightignite.me", "Midnight"],
+            ["https://aiostreams.viren070.me", "Viren"],
+          ]} />
+          <SelectField label="AIOMetadata" value={perfect.aiometadata} onChange={(value) => setPerfect({ ...perfect, aiometadata: value })} options={[
+            ["https://aiometadata.viren070.me", "Viren"],
+            ["https://aiometadatafortheweebs.midnightignite.me", "Midnight"],
+          ]} />
+          <TextField label="RPDB key" value={perfect.rpdbKey} onChange={(value) => setPerfect({ ...perfect, rpdbKey: value })} />
+          <TextField label="TMDB key" type="password" value={perfect.tmdbKey} onChange={(value) => setPerfect({ ...perfect, tmdbKey: value })} />
+          <TextField label="TMDB token" type="password" value={perfect.tmdbToken} onChange={(value) => setPerfect({ ...perfect, tmdbToken: value })} />
+          <TextField label="TVDB key" type="password" value={perfect.tvdbKey} onChange={(value) => setPerfect({ ...perfect, tvdbKey: value })} />
+          <TextField label="Gemini key" type="password" value={perfect.geminiKey} onChange={(value) => setPerfect({ ...perfect, geminiKey: value })} />
+        </div>
+        <div className="form-actions">
+          <button type="submit" disabled={busy}>Generate and install</button>
+        </div>
+      </form>
+    </section>
   );
 }
 
@@ -1455,6 +1587,10 @@ function sortedCatalogs(catalogs) {
     if (left !== right) return left - right;
     return String(a.name || a.id).localeCompare(String(b.name || b.id));
   });
+}
+
+function toggleArrayValue(values, value) {
+  return values.includes(value) ? values.filter((item) => item !== value) : [...values, value];
 }
 
 function isErrorMessage(message) {

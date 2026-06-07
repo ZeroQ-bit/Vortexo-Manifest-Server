@@ -686,6 +686,54 @@ h3 {
   grid-template-columns: minmax(320px, 1.4fr) minmax(190px, 0.7fr) minmax(170px, 0.5fr) minmax(170px, 0.5fr);
 }
 
+.choice-block {
+  display: grid;
+  gap: 10px;
+}
+
+.choice-block > span {
+  color: #d8e0ec;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.choice-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.compact-choice-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.choice-chip {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border-radius: 8px;
+  color: #9aa8bb;
+  background: rgba(255, 255, 255, 0.055);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 13px;
+  font-weight: 850;
+  cursor: pointer;
+}
+
+.choice-chip.selected {
+  color: #ecfeff;
+  background: rgba(56, 189, 248, 0.14);
+  border-color: rgba(125, 211, 252, 0.34);
+}
+
+.choice-chip input {
+  width: 15px;
+  height: 15px;
+  accent-color: #7dd3fc;
+}
+
 .wide-field {
   min-width: 0;
 }
@@ -783,7 +831,8 @@ h3 {
   .metric-grid,
   .addon-grid,
   .form-grid.three,
-  .form-grid.registry-form {
+  .form-grid.registry-form,
+  .choice-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -828,6 +877,8 @@ h3 {
   .form-grid.two,
   .form-grid.three,
   .form-grid.registry-form,
+  .choice-grid,
+  .compact-choice-grid,
   .preview-row,
   .catalog-row,
   .live-row {
