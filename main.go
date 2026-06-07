@@ -2702,7 +2702,7 @@ func streamingCatalogConfigIncludes(config streamingCatalogAddonConfig, catalogT
 	catalogType = normalizeStreamingCatalogCatalogType(catalogType)
 	providerID = canonicalStreamingProviderID(providerID)
 	if providerID == streamingCatalogLatestReleasesID {
-		return config.MergeAll && catalogType == streamingCatalogMergedProviderRowType(streamingCatalogEnabledTypes(config))
+		return config.MergeAll && streamingCatalogMatchesMergedRowType(catalogType, streamingCatalogEnabledTypes(config))
 	}
 	if providerID == streamingCatalogMergedID {
 		return config.MergeProviders && streamingCatalogHasProviderForType(config, catalogType)
@@ -2726,7 +2726,7 @@ func streamingCatalogConfigIncludes(config streamingCatalogAddonConfig, catalogT
 	}
 	if config.MergeProviders {
 		enabledTypes := streamingCatalogProviderEnabledTypes(config, provider)
-		return catalogType == streamingCatalogMergedProviderRowType(enabledTypes)
+		return streamingCatalogMatchesMergedRowType(catalogType, enabledTypes)
 	}
 	if !streamingProviderSupportsType(provider, catalogType) {
 		return false
@@ -2761,12 +2761,21 @@ func streamingCatalogProviderEnabledTypes(config streamingCatalogAddonConfig, pr
 
 func streamingCatalogMergedProviderRowType(types []string) string {
 	if len(types) > 1 {
-		return "mixed"
+		for _, catalogType := range types {
+			if catalogType == "movie" {
+				return "movie"
+			}
+		}
+		return types[0]
 	}
 	if len(types) == 1 {
 		return types[0]
 	}
 	return ""
+}
+
+func streamingCatalogMatchesMergedRowType(catalogType string, enabledTypes []string) bool {
+	return catalogType == streamingCatalogMergedProviderRowType(enabledTypes) || catalogType == "mixed"
 }
 
 func streamingCatalogHasProviderForType(config streamingCatalogAddonConfig, catalogType string) bool {
