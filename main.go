@@ -41,6 +41,11 @@ const (
 	tmdbKeywordRowsDefaultCount     = 10
 	tmdbKeywordRowsMaxCount         = 50
 	tmdbKeywordRowMaxItems          = 50
+	plexPublicRowsDefaultCount      = 8
+	plexPublicRowsMaxCount          = 40
+	plexPublicRowsDefaultItemLimit  = 24
+	plexPublicRowsMaxItemLimit      = 50
+	plexPublicRowsCacheTTL          = 30 * time.Minute
 	plexProduct                     = "Vortexo Manifest Server"
 	plexVersion                     = "1.0.0"
 	plexPlatform                    = "Go"
@@ -76,6 +81,8 @@ type appState struct {
 	tmdbKeywordMu            sync.RWMutex
 	tmdbKeywordRows          map[string]tmdbKeywordRowsCacheEntry
 	tmdbKeywordIDs           map[string]tmdbKeywordIDCacheEntry
+	plexPublicRowsMu         sync.RWMutex
+	plexPublicRows           map[string]plexPublicRowsCacheEntry
 	plexArtworkMu            sync.RWMutex
 	plexArtwork              map[string]plexArtworkCacheRecord
 	plexArtworkSyncMu        sync.Mutex
@@ -96,6 +103,7 @@ type bridgeConfig struct {
 	Plex             plexAuthConfig        `json:"plex,omitempty"`
 	Watch            watchSyncConfig       `json:"watch,omitempty"`
 	TMDBKeywordRows  tmdbKeywordRowsConfig `json:"tmdb_keyword_rows,omitempty"`
+	PlexPublicRows   plexPublicRowsConfig  `json:"plex_public_rows,omitempty"`
 }
 
 type plexAuthConfig struct {
@@ -136,6 +144,15 @@ type tmdbKeywordRowsConfig struct {
 	UpdatedAt       time.Time `json:"updated_at,omitempty"`
 }
 
+type plexPublicRowsConfig struct {
+	Enabled      bool      `json:"enabled,omitempty"`
+	SelectedRows []string  `json:"selected_rows,omitempty"`
+	RowCount     int       `json:"row_count,omitempty"`
+	ItemLimit    int       `json:"item_limit,omitempty"`
+	Section      string    `json:"section,omitempty"`
+	UpdatedAt    time.Time `json:"updated_at,omitempty"`
+}
+
 type installedManifest struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`
@@ -163,6 +180,14 @@ type tmdbKeywordRowsRequest struct {
 	Language         string `json:"language"`
 	Region           string `json:"region"`
 	ClearCredentials bool   `json:"clear_credentials"`
+}
+
+type plexPublicRowsRequest struct {
+	Enabled      bool     `json:"enabled"`
+	SelectedRows []string `json:"selected_rows"`
+	RowCount     int      `json:"row_count"`
+	ItemLimit    int      `json:"item_limit"`
+	Section      string   `json:"section"`
 }
 
 type streamingCatalogSetupResponse struct {
@@ -201,6 +226,20 @@ type tmdbKeywordRowsCacheEntry struct {
 type tmdbKeywordIDCacheEntry struct {
 	id      int
 	expires time.Time
+}
+
+type plexPublicRowsCacheEntry struct {
+	rows    []vortexoHomeRow
+	options []plexPublicRowOption
+	expires time.Time
+}
+
+type plexPublicRowOption struct {
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	Source    string `json:"source"`
+	ItemCount int    `json:"item_count"`
+	Enabled   bool   `json:"enabled"`
 }
 
 type catalogPreference struct {
@@ -989,9 +1028,22 @@ type plexDiscoverMetadataResponse struct {
 		Offset    int                    `json:"offset"`
 		Size      int                    `json:"size"`
 		TotalSize int                    `json:"totalSize"`
+		Hub       []plexDiscoverHub      `json:"Hub"`
 		Metadata  []plexDiscoverMetadata `json:"Metadata"`
 		Directory []plexDiscoverMetadata `json:"Directory"`
 	} `json:"MediaContainer"`
+}
+
+type plexDiscoverHub struct {
+	HubIdentifier string                 `json:"hubIdentifier,omitempty"`
+	Title         string                 `json:"title,omitempty"`
+	Type          string                 `json:"type,omitempty"`
+	HubKey        string                 `json:"hubKey,omitempty"`
+	Key           string                 `json:"key,omitempty"`
+	More          bool                   `json:"more,omitempty"`
+	Size          int                    `json:"size,omitempty"`
+	Metadata      []plexDiscoverMetadata `json:"Metadata,omitempty"`
+	Directory     []plexDiscoverMetadata `json:"Directory,omitempty"`
 }
 
 type plexPin struct {
@@ -1211,6 +1263,7 @@ func run() error {
 		streamingCatalogs: map[string]streamingCatalogCacheEntry{},
 		tmdbKeywordRows:   map[string]tmdbKeywordRowsCacheEntry{},
 		tmdbKeywordIDs:    map[string]tmdbKeywordIDCacheEntry{},
+		plexPublicRows:    map[string]plexPublicRowsCacheEntry{},
 		plexArtwork:       map[string]plexArtworkCacheRecord{},
 	}
 	if err := state.load(); err != nil {
@@ -1247,6 +1300,7 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/bridge/catalogs", s.requireAuth(s.handleCatalogPreferences))
 	mux.HandleFunc("/api/v1/bridge/streaming-catalogs", s.requireAuth(s.handleStreamingCatalogsSetup))
 	mux.HandleFunc("/api/v1/bridge/tmdb-keyword-rows", s.requireAuth(s.handleTMDBKeywordRowsSetup))
+	mux.HandleFunc("/api/v1/bridge/plex-public-rows", s.requireAuth(s.handlePlexPublicRowsSetup))
 	mux.HandleFunc("/api/v1/bridge/perfect-setup", s.requireAuth(s.handlePerfectSetup))
 	mux.HandleFunc("/api/v1/bridge/manifests", s.requireAuth(s.handleManifests))
 	mux.HandleFunc("/api/v1/bridge/manifests/", s.requireAuth(s.handleManifestByID))
@@ -1337,6 +1391,11 @@ func (s *appState) load() error {
 	normalizedKeywords := normalizeTMDBKeywordRowsConfig(s.config.TMDBKeywordRows)
 	if normalizedKeywords != s.config.TMDBKeywordRows {
 		s.config.TMDBKeywordRows = normalizedKeywords
+		changed = true
+	}
+	normalizedPlexPublicRows := normalizePlexPublicRowsConfig(s.config.PlexPublicRows)
+	if !plexPublicRowsConfigEqual(normalizedPlexPublicRows, s.config.PlexPublicRows) {
+		s.config.PlexPublicRows = normalizedPlexPublicRows
 		changed = true
 	}
 	for i := range s.config.Manifests {
@@ -2274,6 +2333,7 @@ func (s *appState) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 		"live_tv":              true,
 		"watch_history":        true,
 		"manifest_bridge":      true,
+		"plex_public_rows":     true,
 		"requires_app_changes": false,
 		"types":                []string{"movie", "show", "season", "episode", "live_tv", "watch_history"},
 	})
@@ -2291,6 +2351,7 @@ func (s *appState) handleBridgeDashboard(w http.ResponseWriter, r *http.Request)
 	registryURL := firstNonEmpty(s.config.AddonRegistryURL, defaultRegistryURL)
 	watch := s.config.Watch
 	tmdbKeywordRows := s.config.TMDBKeywordRows
+	plexPublicRows := s.config.PlexPublicRows
 	watchCount := len(s.watchState.Items)
 	watchUpdatedAt := s.watchState.UpdatedAt
 	s.mu.RUnlock()
@@ -2349,6 +2410,7 @@ func (s *appState) handleBridgeDashboard(w http.ResponseWriter, r *http.Request)
 		"registry_url":      registryURL,
 		"artwork":           s.plexArtworkDashboardStats(),
 		"tmdb_keyword_rows": tmdbKeywordRowsDashboardSummary(tmdbKeywordRows, time.Now().UTC()),
+		"plex_public_rows":  s.plexPublicRowsDashboardSummary(r.Context(), plexPublicRows),
 		"watch": map[string]any{
 			"count":               watchCount,
 			"updated_at":          watchUpdatedAt,
@@ -2563,6 +2625,55 @@ func (s *appState) handleTMDBKeywordRowsSetup(w http.ResponseWriter, r *http.Req
 
 		s.clearTMDBKeywordRowsCache()
 		respondJSON(w, http.StatusOK, tmdbKeywordRowsDashboardSummary(next, time.Now().UTC()))
+	default:
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *appState) handlePlexPublicRowsSetup(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.mu.RLock()
+		config := s.config.PlexPublicRows
+		s.mu.RUnlock()
+		if section := strings.TrimSpace(r.URL.Query().Get("section")); section != "" {
+			config.Section = section
+		}
+		if itemLimit := boundedInt(r.URL.Query().Get("item_limit"), 0, 0, plexPublicRowsMaxItemLimit); itemLimit > 0 {
+			config.ItemLimit = itemLimit
+		}
+		respondJSON(w, http.StatusOK, s.plexPublicRowsDashboardSummary(r.Context(), config))
+	case http.MethodPost:
+		var req plexPublicRowsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			respondError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+
+		next := normalizePlexPublicRowsConfig(plexPublicRowsConfig{
+			Enabled:      req.Enabled,
+			SelectedRows: req.SelectedRows,
+			RowCount:     req.RowCount,
+			ItemLimit:    req.ItemLimit,
+			Section:      req.Section,
+			UpdatedAt:    time.Now().UTC(),
+		})
+		if next.Enabled && s.plexAccountToken() == "" {
+			respondError(w, http.StatusBadRequest, "Plex account token is required")
+			return
+		}
+
+		s.mu.Lock()
+		s.config.PlexPublicRows = next
+		err := s.saveLocked()
+		s.mu.Unlock()
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, "failed to save Plex public rows")
+			return
+		}
+
+		s.clearPlexPublicRowsCache()
+		respondJSON(w, http.StatusOK, s.plexPublicRowsDashboardSummary(r.Context(), next))
 	default:
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -4224,6 +4335,475 @@ func (s *appState) clearTMDBKeywordRowsCache() {
 	s.tmdbKeywordMu.Unlock()
 }
 
+func normalizePlexPublicRowsConfig(config plexPublicRowsConfig) plexPublicRowsConfig {
+	config.Section = strings.ToLower(firstNonEmpty(strings.TrimSpace(config.Section), "home"))
+	switch config.Section {
+	case "home", "watchlist":
+	default:
+		config.Section = "home"
+	}
+	if config.RowCount <= 0 {
+		config.RowCount = plexPublicRowsDefaultCount
+	}
+	config.RowCount = minInt(config.RowCount, plexPublicRowsMaxCount)
+	if config.ItemLimit <= 0 {
+		config.ItemLimit = plexPublicRowsDefaultItemLimit
+	}
+	config.ItemLimit = boundedInt(strconv.Itoa(config.ItemLimit), plexPublicRowsDefaultItemLimit, 6, plexPublicRowsMaxItemLimit)
+	config.SelectedRows = uniqueNonEmptyStrings(config.SelectedRows)
+	return config
+}
+
+func plexPublicRowsConfigEqual(a plexPublicRowsConfig, b plexPublicRowsConfig) bool {
+	if a.Enabled != b.Enabled ||
+		a.RowCount != b.RowCount ||
+		a.ItemLimit != b.ItemLimit ||
+		a.Section != b.Section ||
+		!a.UpdatedAt.Equal(b.UpdatedAt) ||
+		len(a.SelectedRows) != len(b.SelectedRows) {
+		return false
+	}
+	for i := range a.SelectedRows {
+		if a.SelectedRows[i] != b.SelectedRows[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *appState) plexPublicRowsDashboardSummary(ctx context.Context, config plexPublicRowsConfig) map[string]any {
+	config = normalizePlexPublicRowsConfig(config)
+	options, err := s.plexPublicRowOptions(ctx, config)
+	response := map[string]any{
+		"enabled":            config.Enabled,
+		"selected_rows":      config.SelectedRows,
+		"row_count":          config.RowCount,
+		"item_limit":         config.ItemLimit,
+		"section":            config.Section,
+		"has_plex_token":     s.plexAccountToken() != "",
+		"rows":               []plexPublicRowOption{},
+		"max_row_count":      plexPublicRowsMaxCount,
+		"max_item_limit":     plexPublicRowsMaxItemLimit,
+		"default_row_count":  plexPublicRowsDefaultCount,
+		"default_item_limit": plexPublicRowsDefaultItemLimit,
+	}
+	if err != nil {
+		response["error"] = err.Error()
+		return response
+	}
+	response["rows"] = options
+	return response
+}
+
+func (s *appState) plexPublicRowOptions(ctx context.Context, config plexPublicRowsConfig) ([]plexPublicRowOption, error) {
+	config = normalizePlexPublicRowsConfig(config)
+	cacheKey := "options:" + config.Section + ":" + strconv.Itoa(config.ItemLimit)
+	now := time.Now().UTC()
+
+	s.plexPublicRowsMu.RLock()
+	cached, ok := s.plexPublicRows[cacheKey]
+	s.plexPublicRowsMu.RUnlock()
+	if ok && now.Before(cached.expires) {
+		return markSelectedPlexPublicRowOptions(cached.options, config.SelectedRows), nil
+	}
+
+	token := s.plexAccountToken()
+	if token == "" {
+		return []plexPublicRowOption{}, fmt.Errorf("Plex account token is required")
+	}
+
+	hubs, err := s.fetchPlexDiscoverSectionHubs(ctx, token, config.Section, config.ItemLimit)
+	if err != nil {
+		return []plexPublicRowOption{}, err
+	}
+	options := make([]plexPublicRowOption, 0, len(hubs))
+	for _, hub := range hubs {
+		option := plexPublicRowOptionFromHub(config.Section, hub, token)
+		if option.ID == "" || option.ItemCount == 0 {
+			continue
+		}
+		options = append(options, option)
+	}
+
+	s.plexPublicRowsMu.Lock()
+	if s.plexPublicRows == nil {
+		s.plexPublicRows = map[string]plexPublicRowsCacheEntry{}
+	}
+	s.plexPublicRows[cacheKey] = plexPublicRowsCacheEntry{
+		options: append([]plexPublicRowOption(nil), options...),
+		expires: now.Add(plexPublicRowsCacheTTL),
+	}
+	s.plexPublicRowsMu.Unlock()
+
+	return markSelectedPlexPublicRowOptions(options, config.SelectedRows), nil
+}
+
+func markSelectedPlexPublicRowOptions(options []plexPublicRowOption, selectedRows []string) []plexPublicRowOption {
+	selected := stringSet(selectedRows)
+	out := make([]plexPublicRowOption, 0, len(options))
+	for _, option := range options {
+		option.Enabled = selected[option.ID]
+		out = append(out, option)
+	}
+	return out
+}
+
+func (s *appState) plexPublicHomeRows(ctx context.Context, itemLimit int, rowLimit int, now time.Time) ([]vortexoHomeRow, time.Time) {
+	s.mu.RLock()
+	config := s.config.PlexPublicRows
+	s.mu.RUnlock()
+	config = normalizePlexPublicRowsConfig(config)
+	if !config.Enabled || len(config.SelectedRows) == 0 || rowLimit <= 0 || s.plexAccountToken() == "" {
+		return []vortexoHomeRow{}, time.Time{}
+	}
+	if itemLimit <= 0 {
+		itemLimit = config.ItemLimit
+	}
+	itemLimit = minInt(itemLimit, config.ItemLimit)
+	itemLimit = boundedInt(strconv.Itoa(itemLimit), config.ItemLimit, 6, plexPublicRowsMaxItemLimit)
+
+	cacheKey := strings.Join([]string{
+		"rows",
+		config.Section,
+		strconv.Itoa(config.RowCount),
+		strconv.Itoa(itemLimit),
+		strings.Join(config.SelectedRows, ","),
+	}, ":")
+	s.plexPublicRowsMu.RLock()
+	cached, ok := s.plexPublicRows[cacheKey]
+	s.plexPublicRowsMu.RUnlock()
+	if ok && now.Before(cached.expires) {
+		return cloneVortexoHomeRows(cached.rows), cached.expires
+	}
+
+	token := s.plexAccountToken()
+	hubs, err := s.fetchPlexDiscoverSectionHubs(ctx, token, config.Section, itemLimit)
+	if err != nil {
+		log.Printf("Plex public rows failed: %v", err)
+		return []vortexoHomeRow{}, time.Time{}
+	}
+
+	hubsByID := map[string]plexDiscoverHub{}
+	for _, hub := range hubs {
+		id := plexPublicRowID(config.Section, hub)
+		if id != "" {
+			hubsByID[id] = hub
+		}
+	}
+
+	rows := make([]vortexoHomeRow, 0, minInt(rowLimit, config.RowCount))
+	for _, selectedID := range config.SelectedRows {
+		if len(rows) >= rowLimit || len(rows) >= config.RowCount {
+			break
+		}
+		hub, ok := hubsByID[selectedID]
+		if !ok {
+			continue
+		}
+		row := plexPublicHomeRowFromHub(config.Section, hub, token, itemLimit)
+		if len(row.Items) == 0 {
+			continue
+		}
+		rows = append(rows, row)
+	}
+
+	expires := now.Add(plexPublicRowsCacheTTL)
+	s.plexPublicRowsMu.Lock()
+	if s.plexPublicRows == nil {
+		s.plexPublicRows = map[string]plexPublicRowsCacheEntry{}
+	}
+	s.plexPublicRows[cacheKey] = plexPublicRowsCacheEntry{
+		rows:    cloneVortexoHomeRows(rows),
+		expires: expires,
+	}
+	s.plexPublicRowsMu.Unlock()
+
+	return rows, expires
+}
+
+func (s *appState) fetchPlexDiscoverSectionHubs(ctx context.Context, token string, section string, count int) ([]plexDiscoverHub, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil, fmt.Errorf("Plex account token is required")
+	}
+	section = strings.ToLower(firstNonEmpty(strings.TrimSpace(section), "home"))
+	if section != "home" && section != "watchlist" {
+		section = "home"
+	}
+	count = boundedInt(strconv.Itoa(count), plexPublicRowsDefaultItemLimit, 6, plexPublicRowsMaxItemLimit)
+
+	components, err := url.Parse("https://discover.provider.plex.tv/hubs/sections/" + section)
+	if err != nil {
+		return nil, err
+	}
+	values := url.Values{}
+	for _, item := range s.plexDiscoverQueryItems(token) {
+		values.Add(item.Name, item.Value)
+	}
+	for _, item := range []plexQueryItem{
+		{Name: "count", Value: strconv.Itoa(count)},
+		{Name: "includeLibraryPlaylists", Value: "1"},
+		{Name: "includeStations", Value: "1"},
+		{Name: "includeRecentChannels", Value: "1"},
+		{Name: "includeMeta", Value: "1"},
+		{Name: "includeExternalMetadata", Value: "1"},
+		{Name: "includeUserState", Value: "1"},
+		{Name: "includeGuids", Value: "1"},
+		{Name: "includeImages", Value: "1"},
+	} {
+		values.Set(item.Name, item.Value)
+	}
+	components.RawQuery = values.Encode()
+
+	var response plexDiscoverMetadataResponse
+	if err := s.plexJSON(ctx, http.MethodGet, components.String(), nil, s.plexDiscoverHeaders(token), &response); err != nil {
+		return nil, err
+	}
+	return s.hydratePlexDiscoverHubs(ctx, token, response.MediaContainer.Hub, count), nil
+}
+
+func (s *appState) hydratePlexDiscoverHubs(ctx context.Context, token string, hubs []plexDiscoverHub, count int) []plexDiscoverHub {
+	out := make([]plexDiscoverHub, 0, len(hubs))
+	for _, hub := range hubs {
+		if len(plexDiscoverHubItems(hub)) == 0 && firstNonEmpty(hub.Key, hub.HubKey) != "" {
+			if hydrated, err := s.fetchPlexDiscoverHub(ctx, token, hub, count); err == nil {
+				hub = hydrated
+			} else {
+				log.Printf("Plex public hub hydrate failed %q: %v", firstNonEmpty(hub.Title, hub.Key, hub.HubKey), err)
+			}
+		}
+		if len(plexDiscoverHubItems(hub)) > 0 {
+			out = append(out, hub)
+		}
+	}
+	return out
+}
+
+func (s *appState) fetchPlexDiscoverHub(ctx context.Context, token string, rootHub plexDiscoverHub, count int) (plexDiscoverHub, error) {
+	rawPath := firstNonEmpty(rootHub.Key, rootHub.HubKey)
+	if rawPath == "" {
+		return rootHub, fmt.Errorf("missing Plex hub path")
+	}
+	rawURL, err := s.plexDiscoverProviderURL(rawPath, token, count)
+	if err != nil {
+		return rootHub, err
+	}
+	var response plexDiscoverMetadataResponse
+	if err := s.plexJSON(ctx, http.MethodGet, rawURL, nil, s.plexDiscoverHeaders(token), &response); err != nil {
+		return rootHub, err
+	}
+
+	hub := rootHub
+	if len(response.MediaContainer.Hub) > 0 {
+		hub = response.MediaContainer.Hub[0]
+	}
+	if len(response.MediaContainer.Metadata) > 0 {
+		hub.Metadata = response.MediaContainer.Metadata
+	} else if len(response.MediaContainer.Directory) > 0 {
+		hub.Metadata = response.MediaContainer.Directory
+	} else if len(plexDiscoverHubItems(hub)) == 0 {
+		hub.Metadata = plexDiscoverHubItems(rootHub)
+	}
+	hub.Title = firstNonEmpty(hub.Title, rootHub.Title)
+	hub.Type = firstNonEmpty(hub.Type, rootHub.Type)
+	hub.Key = firstNonEmpty(hub.Key, rootHub.Key)
+	hub.HubKey = firstNonEmpty(hub.HubKey, rootHub.HubKey)
+	hub.HubIdentifier = firstNonEmpty(hub.HubIdentifier, rootHub.HubIdentifier)
+	return hub, nil
+}
+
+func (s *appState) plexDiscoverProviderURL(rawPath string, token string, count int) (string, error) {
+	normalizedPath := normalizedPlexDiscoverProviderPath(rawPath)
+	var components *url.URL
+	var err error
+	if strings.HasPrefix(strings.ToLower(normalizedPath), "http://") || strings.HasPrefix(strings.ToLower(normalizedPath), "https://") {
+		components, err = url.Parse(normalizedPath)
+	} else {
+		components, err = url.Parse("https://discover.provider.plex.tv/" + strings.TrimLeft(normalizedPath, "/"))
+	}
+	if err != nil {
+		return "", err
+	}
+	values := components.Query()
+	for _, item := range s.plexDiscoverQueryItems(token) {
+		values.Set(item.Name, item.Value)
+	}
+	for _, item := range []plexQueryItem{
+		{Name: "count", Value: strconv.Itoa(boundedInt(strconv.Itoa(count), plexPublicRowsDefaultItemLimit, 6, plexPublicRowsMaxItemLimit))},
+		{Name: "includeMeta", Value: "1"},
+		{Name: "includeExternalMetadata", Value: "1"},
+		{Name: "includeUserState", Value: "1"},
+		{Name: "includeGuids", Value: "1"},
+		{Name: "includeImages", Value: "1"},
+	} {
+		values.Set(item.Name, item.Value)
+	}
+	components.RawQuery = values.Encode()
+	return components.String(), nil
+}
+
+func normalizedPlexDiscoverProviderPath(path string) string {
+	path = strings.TrimSpace(path)
+	if strings.HasPrefix(path, "provider://") {
+		if idx := strings.Index(path, "tv.plex.provider.discover"); idx >= 0 {
+			suffix := path[idx+len("tv.plex.provider.discover"):]
+			if strings.HasPrefix(suffix, "/") {
+				return suffix
+			}
+		}
+		if idx := strings.Index(path, "/library/metadata/"); idx >= 0 {
+			return path[idx:]
+		}
+		if idx := strings.Index(path, "/hubs"); idx >= 0 {
+			return path[idx:]
+		}
+	}
+	return path
+}
+
+func plexPublicRowOptionFromHub(section string, hub plexDiscoverHub, token string) plexPublicRowOption {
+	id := plexPublicRowID(section, hub)
+	title := firstNonEmpty(hub.Title, "Plex Row")
+	count := 0
+	for _, item := range plexDiscoverHubItems(hub) {
+		if _, ok := plexPublicHomeItemFromDiscover(item, token); ok {
+			count++
+		}
+	}
+	return plexPublicRowOption{
+		ID:        id,
+		Title:     title,
+		Source:    "Plex Discover",
+		ItemCount: count,
+	}
+}
+
+func plexPublicHomeRowFromHub(section string, hub plexDiscoverHub, token string, itemLimit int) vortexoHomeRow {
+	rowID := "plex-public-" + plexPublicRowID(section, hub)
+	rowItems := make([]vortexoHomeItem, 0, itemLimit)
+	seen := map[string]bool{}
+	for _, meta := range plexDiscoverHubItems(hub) {
+		item, ok := plexPublicHomeItemFromDiscover(meta, token)
+		if !ok {
+			continue
+		}
+		key := homeDedupeKey(item)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		rowItems = append(rowItems, item)
+		if len(rowItems) >= itemLimit {
+			break
+		}
+	}
+	return vortexoHomeRow{
+		ID:     rowID,
+		Title:  firstNonEmpty(hub.Title, "Plex Row"),
+		Reason: "Plex Discover",
+		Items:  rowItems,
+	}
+}
+
+func plexPublicHomeItemFromDiscover(meta plexDiscoverMetadata, token string) (vortexoHomeItem, bool) {
+	rawType := strings.ToLower(strings.TrimSpace(meta.Type))
+	mediaType := ""
+	ratingType := ""
+	guidMediaType := ""
+	switch rawType {
+	case "movie":
+		mediaType = "movie"
+		ratingType = "movie"
+		guidMediaType = "movie"
+	case "show", "tv", "series":
+		mediaType = "tv"
+		ratingType = "show"
+		guidMediaType = "tv"
+	default:
+		return vortexoHomeItem{}, false
+	}
+
+	tmdbID, imdbID := plexDiscoverExternalIDs(meta, mediaType)
+	if tmdbID <= 0 {
+		return vortexoHomeItem{}, false
+	}
+	title := firstNonEmpty(meta.Title, meta.OriginalTitle)
+	if title == "" {
+		return vortexoHomeItem{}, false
+	}
+
+	artwork := plexArtworkFromDiscoverMetadata(meta, token)
+	date := meta.OriginallyAvailableAt
+	runtime := 0
+	if meta.Duration > 0 {
+		runtime = meta.Duration / 60000
+	}
+	tmdbIDText := strconv.Itoa(tmdbID)
+	guid := "tmdb://" + guidMediaType + "/" + tmdbIDText
+	item := vortexoHomeItem{
+		ID:            "tmdb:" + tmdbIDText,
+		RatingKey:     "vortexo:tmdb:" + ratingType + ":" + tmdbIDText,
+		Key:           guid,
+		GUID:          guid,
+		MediaType:     mediaType,
+		TMDBID:        tmdbID,
+		IMDBID:        imdbID,
+		Title:         title,
+		OriginalTitle: meta.OriginalTitle,
+		Overview:      meta.Summary,
+		PosterPath:    firstNonEmpty(firstPlexArtworkURL(artwork.Thumbnail), meta.Thumb),
+		BackdropPath:  firstNonEmpty(firstPlexArtworkURL(artwork.Background), meta.Art),
+		LandscapePath: firstNonEmpty(firstPlexArtworkURL(artwork.Landscape, artwork.CoverArt), meta.Banner, meta.Art),
+		LogoPath:      firstPlexArtworkURL(artwork.ClearLogo),
+		Year:          firstNonZero(meta.Year, yearFromText(date)),
+		Runtime:       runtime,
+		VoteAverage:   firstNonZeroFloat(float64(meta.AudienceRating), float64(meta.Rating)),
+		AddedAt:       time.Now().Unix(),
+		UpdatedAt:     time.Now().Unix(),
+	}
+	if mediaType == "tv" {
+		item.FirstAirDate = date
+	} else {
+		item.ReleaseDate = date
+	}
+	return item, true
+}
+
+func plexPublicRowID(section string, hub plexDiscoverHub) string {
+	raw := firstNonEmpty(hub.HubIdentifier, hub.Key, hub.HubKey, hub.Title)
+	if raw == "" {
+		return ""
+	}
+	label := slug(firstNonEmpty(hub.HubIdentifier, hub.Title, "row"))
+	if label == "" {
+		label = "row"
+	}
+	hash := strconv.FormatUint(stableHash64(section+":"+raw), 36)
+	return slug(section) + "-" + label + "-" + hash
+}
+
+func plexDiscoverHubItems(hub plexDiscoverHub) []plexDiscoverMetadata {
+	if len(hub.Metadata) > 0 {
+		return hub.Metadata
+	}
+	return hub.Directory
+}
+
+func cloneVortexoHomeRows(rows []vortexoHomeRow) []vortexoHomeRow {
+	out := make([]vortexoHomeRow, 0, len(rows))
+	for _, row := range rows {
+		row.Items = append([]vortexoHomeItem(nil), row.Items...)
+		out = append(out, row)
+	}
+	return out
+}
+
+func (s *appState) clearPlexPublicRowsCache() {
+	s.plexPublicRowsMu.Lock()
+	s.plexPublicRows = map[string]plexPublicRowsCacheEntry{}
+	s.plexPublicRowsMu.Unlock()
+}
+
 var tmdbKeywordPhrasePool = []string{
 	"mind bending",
 	"crime thriller",
@@ -4898,9 +5478,17 @@ func (s *appState) handleVortexoHome(w http.ResponseWriter, r *http.Request) {
 	defaultRowLimit := 12
 	s.mu.RLock()
 	keywordConfig := normalizeTMDBKeywordRowsConfig(s.config.TMDBKeywordRows)
+	plexPublicConfig := normalizePlexPublicRowsConfig(s.config.PlexPublicRows)
 	s.mu.RUnlock()
+	configuredRowLimit := 0
 	if keywordConfig.Enabled {
-		defaultRowLimit = maxInt(defaultRowLimit, keywordConfig.RowCount)
+		configuredRowLimit += keywordConfig.RowCount
+	}
+	if plexPublicConfig.Enabled {
+		configuredRowLimit += plexPublicConfig.RowCount
+	}
+	if configuredRowLimit > 0 {
+		defaultRowLimit = maxInt(defaultRowLimit, configuredRowLimit)
 	}
 	rowLimit := boundedInt(r.URL.Query().Get("row_limit"), defaultRowLimit, 1, 60)
 	itemLimit := boundedInt(r.URL.Query().Get("item_limit"), 30, 6, 50)
@@ -4932,6 +5520,31 @@ func (s *appState) handleVortexoHome(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		row.Items = rowItems
+		rows = append(rows, row)
+	}
+
+	plexRows, plexRefreshAfter := s.plexPublicHomeRows(r.Context(), itemLimit, rowLimit-len(rows), now)
+	if !plexRefreshAfter.IsZero() {
+		refreshAfter = minTime(refreshAfter, plexRefreshAfter)
+	}
+	for _, row := range plexRows {
+		if len(rows) >= rowLimit {
+			break
+		}
+		rowItems := make([]vortexoHomeItem, 0, len(row.Items))
+		for _, item := range row.Items {
+			key := homeDedupeKey(item)
+			if key == "" || used[key] {
+				continue
+			}
+			used[key] = true
+			rowItems = append(rowItems, item)
+		}
+		if len(rowItems) == 0 {
+			continue
+		}
+		row.Items = rowItems
+		row.RefreshAfter = refreshAfter
 		rows = append(rows, row)
 	}
 
@@ -10243,6 +10856,17 @@ func uniqueNonEmptyStrings(values []string) []string {
 	return out
 }
 
+func stringSet(values []string) map[string]bool {
+	out := make(map[string]bool, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out[value] = true
+		}
+	}
+	return out
+}
+
 func normalizedSearchText(value string) string {
 	value = strings.ToLower(strings.TrimSpace(html.UnescapeString(value)))
 	if value == "" {
@@ -11015,6 +11639,34 @@ const indexHTML = `<!doctype html>
               <div id="traktDeviceBox" class="message muted"></div>
             </div>
           </div>
+          <div class="panel" style="margin-top:18px;">
+            <h3>Plex Public Rows</h3>
+            <p class="muted">Select Plex Discover rows to inject into Vortexo Home. Playback still comes from your installed stream add-ons.</p>
+            <div class="two">
+              <label class="check"><input id="plexPublicRowsEnabled" type="checkbox"><span><strong>Enable Plex rows</strong><br><span class="muted">Selected public rows appear after Random Keyword Rows.</span></span></label>
+              <div>
+                <label>Section</label>
+                <select id="plexPublicSection">
+                  <option value="home">Home</option>
+                  <option value="watchlist">Watchlist</option>
+                </select>
+              </div>
+              <div>
+                <label>Maximum rows</label>
+                <input id="plexPublicRowCount" type="number" min="1" max="40" value="8">
+              </div>
+              <div>
+                <label>Items per row</label>
+                <input id="plexPublicItemLimit" type="number" min="6" max="50" value="24">
+              </div>
+            </div>
+            <div id="plexPublicRowsList" class="checklist"></div>
+            <div class="actions">
+              <button onclick="savePlexPublicRows()">Save Plex Rows</button>
+              <button class="secondary" onclick="loadPlexPublicRows()">Refresh Rows</button>
+            </div>
+            <div id="plexPublicRowsStatus" class="message muted">Sign in with Plex to load public row choices.</div>
+          </div>
           <div class="actions">
             <button class="secondary" onclick="loadWatchSettings()">Refresh Watch Status</button>
             <button onclick="showStep('install')">Continue</button>
@@ -11237,6 +11889,7 @@ async function loadWatchSettings() {
     + " · Trakt token: " + (trakt.has_access_token ? "<span class='ok'>saved</span>" : "<span class='muted'>missing</span>");
   watchStatus.className = "message muted";
   await loadPlexSettings();
+  await loadPlexPublicRows();
 }
 async function loadPlexSettings() {
   if (!token) return;
@@ -11248,6 +11901,64 @@ async function loadPlexSettings() {
   plexStatus.innerHTML = "Plex token: " + (plex.has_access_token ? "<span class='ok'>saved</span>" : "<span class='muted'>missing</span>")
     + (name ? " · Account: <strong>" + escapeHtml(name) + "</strong>" : "");
   plexStatus.className = "message muted";
+}
+async function loadPlexPublicRows() {
+  if (!token) return;
+  plexPublicRowsStatus.textContent = "Loading Plex rows...";
+  plexPublicRowsStatus.className = "message muted";
+  const params = new URLSearchParams();
+  if (typeof plexPublicSection !== "undefined" && plexPublicSection.value) params.set("section", plexPublicSection.value);
+  if (typeof plexPublicItemLimit !== "undefined" && plexPublicItemLimit.value) params.set("item_limit", plexPublicItemLimit.value);
+  const url = "/api/v1/bridge/plex-public-rows" + (params.toString() ? "?" + params.toString() : "");
+  const res = await fetch(url, {headers:{authorization:"Bearer " + token}});
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { plexPublicRowsStatus.textContent = data.message || "Unable to load Plex rows."; plexPublicRowsStatus.className = "message error"; return; }
+  plexPublicRowsEnabled.checked = !!data.enabled;
+  plexPublicSection.value = data.section || "home";
+  plexPublicRowCount.value = data.row_count || data.default_row_count || 8;
+  plexPublicItemLimit.value = data.item_limit || data.default_item_limit || 24;
+  const rows = data.rows || [];
+  plexPublicRowsList.innerHTML = "";
+  if (data.error) {
+    plexPublicRowsStatus.textContent = data.error;
+    plexPublicRowsStatus.className = "message error";
+    return;
+  }
+  if (rows.length === 0) {
+    plexPublicRowsStatus.textContent = data.has_plex_token ? "Plex returned no selectable rows." : "Connect Plex first.";
+    plexPublicRowsStatus.className = "message muted";
+    return;
+  }
+  rows.forEach((row) => {
+    const label = document.createElement("label");
+    label.className = "check";
+    label.innerHTML = "<input class='plex-public-row-check' type='checkbox' value='" + escapeAttr(row.id) + "'" + (row.enabled ? " checked" : "") + ">"
+      + "<span><strong>" + escapeHtml(row.title || row.id) + "</strong><br><span class='muted'>"
+      + escapeHtml(row.source || "Plex Discover") + " · " + escapeHtml(String(row.item_count || 0)) + " playable catalog items</span></span>";
+    plexPublicRowsList.appendChild(label);
+  });
+  plexPublicRowsStatus.textContent = "Loaded " + rows.length + " Plex row choices.";
+  plexPublicRowsStatus.className = "message ok";
+}
+async function savePlexPublicRows() {
+  if (!token) { plexPublicRowsStatus.textContent = "Sign in first."; plexPublicRowsStatus.className = "message error"; showStep("signin"); return; }
+  const selected = Array.from(document.querySelectorAll(".plex-public-row-check:checked")).map((el) => el.value);
+  const payload = {
+    enabled: plexPublicRowsEnabled.checked,
+    selected_rows: selected,
+    row_count: parseInt(plexPublicRowCount.value || "8", 10),
+    item_limit: parseInt(plexPublicItemLimit.value || "24", 10),
+    section: plexPublicSection.value || "home"
+  };
+  plexPublicRowsStatus.textContent = "Saving Plex row selection...";
+  plexPublicRowsStatus.className = "message muted";
+  const res = await fetch("/api/v1/bridge/plex-public-rows", {method:"POST", headers:{"content-type":"application/json", authorization:"Bearer " + token}, body: JSON.stringify(payload)});
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { plexPublicRowsStatus.textContent = data.message || "Failed to save Plex rows."; plexPublicRowsStatus.className = "message error"; return; }
+  markDone("watch");
+  plexPublicRowsStatus.textContent = "Plex rows saved.";
+  plexPublicRowsStatus.className = "message ok";
+  await loadPlexPublicRows();
 }
 async function savePlexSettings() {
   if (!token) { plexStatus.textContent = "Sign in first."; plexStatus.className = "message error"; showStep("signin"); return; }
@@ -11263,6 +11974,7 @@ async function savePlexSettings() {
   plexStatus.textContent = "Plex connected. Artwork cache will use Discover landscapes on the next refresh.";
   plexStatus.className = "message ok";
   await loadPlexSettings();
+  await loadPlexPublicRows();
 }
 async function clearPlexSettings() {
   if (!token) { plexStatus.textContent = "Sign in first."; plexStatus.className = "message error"; showStep("signin"); return; }
@@ -11275,6 +11987,7 @@ async function clearPlexSettings() {
   plexStatus.textContent = "Plex token cleared. Artwork will fall back to public pages and backdrop-plus-logo cards.";
   plexStatus.className = "message ok";
   await loadPlexSettings();
+  await loadPlexPublicRows();
 }
 async function startPlexLogin() {
   if (!token) { plexStatus.textContent = "Sign in first."; plexStatus.className = "message error"; showStep("signin"); return; }
@@ -11311,6 +12024,7 @@ async function pollPlexLogin() {
   plexDeviceBox.className = "message ok";
   markDone("watch");
   await loadPlexSettings();
+  await loadPlexPublicRows();
 }
 async function saveWatchSettings() {
   if (!token) { watchStatus.textContent = "Sign in first."; watchStatus.className = "message error"; showStep("signin"); return; }
