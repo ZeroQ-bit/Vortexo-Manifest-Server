@@ -113,6 +113,7 @@ function App() {
   const [plexStatus, setPlexStatus] = useState("");
   const [plexPublicRows, setPlexPublicRows] = useState(emptyPlexPublicRows);
   const [plexPublicRowsStatus, setPlexPublicRowsStatus] = useState("");
+  const [plexPublicRowsBusy, setPlexPublicRowsBusy] = useState(false);
   const [plexPin, setPlexPin] = useState(() => {
     const id = Number(localStorage.getItem("vortexoPlexPinID") || 0);
     return id > 0 ? { id } : null;
@@ -618,7 +619,7 @@ function App() {
     params.set("section", section);
     params.set("item_limit", String(itemLimit));
     params.set("refresh", "1");
-    setBusy(true);
+    setPlexPublicRowsBusy(true);
     setPlexPublicRowsStatus("Loading Plex row choices...");
     try {
       const data = await request(`/api/v1/bridge/plex-public-rows?${params.toString()}`);
@@ -630,7 +631,7 @@ function App() {
       setMessage(error.message);
       setPlexPublicRowsStatus(error.message);
     } finally {
-      setBusy(false);
+      setPlexPublicRowsBusy(false);
     }
   }
 
@@ -1001,6 +1002,7 @@ function App() {
                 plexPublicRows={plexPublicRows}
                 setPlexPublicRows={setPlexPublicRows}
                 plexPublicRowsStatus={plexPublicRowsStatus}
+                plexPublicRowsBusy={plexPublicRowsBusy}
                 onSavePlex={savePlexToken}
                 onClearPlex={clearPlexToken}
                 onStartPlex={startPlexLogin}
@@ -1644,6 +1646,7 @@ function WatchSync({
   plexPublicRows,
   setPlexPublicRows,
   plexPublicRowsStatus,
+  plexPublicRowsBusy,
   onSavePlex,
   onClearPlex,
   onStartPlex,
@@ -1665,7 +1668,7 @@ function WatchSync({
   const plexRows = plexPublicRows?.rows || [];
   const selectedPlexRows = plexPublicRows?.selectedRows || [];
   const plexRowCountOptions = uniqueOptions([plexPublicRows?.rowCount || 8, 4, 8, 12, 20, 30, 40].filter((count) => count <= (plexPublicRows?.maxRowCount || 40)));
-  const plexItemLimitOptions = uniqueOptions([plexPublicRows?.itemLimit || 24, 12, 24, 36, 50].filter((count) => count <= (plexPublicRows?.maxItemLimit || 50)));
+  const plexItemLimitOptions = uniqueOptions([plexPublicRows?.itemLimit || 24, 12, 24].filter((count) => count <= (plexPublicRows?.maxItemLimit || 24)));
   return (
     <section className="stack">
       <div className="metric-grid two-cols">
@@ -1825,7 +1828,9 @@ function WatchSync({
         )}
 
         <div className="form-actions">
-          <button type="button" className="secondary" onClick={() => onLoadPlexPublicRows()} disabled={busy || !hasPlexToken}>Refresh Row Choices</button>
+          <button type="button" className="secondary" onClick={() => onLoadPlexPublicRows()} disabled={plexPublicRowsBusy || !hasPlexToken}>
+            {plexPublicRowsBusy ? "Loading Rows" : "Refresh Row Choices"}
+          </button>
           <button type="submit" disabled={busy || (plexPublicRows?.enabled && (!hasPlexToken || selectedPlexRows.length === 0))}>Save Plex Rows</button>
         </div>
         {plexPublicRowsStatus && <div className={isErrorMessage(plexPublicRowsStatus) ? "inline-error" : "inline-note"}>{plexPublicRowsStatus}</div>}

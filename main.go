@@ -44,7 +44,8 @@ const (
 	plexPublicRowsDefaultCount      = 8
 	plexPublicRowsMaxCount          = 40
 	plexPublicRowsDefaultItemLimit  = 24
-	plexPublicRowsMaxItemLimit      = 50
+	plexPublicRowsMaxItemLimit      = 24
+	plexPublicRowsChoiceItemLimit   = 12
 	plexPublicRowsCacheTTL          = 30 * time.Minute
 	plexProduct                     = "Vortexo Manifest Server"
 	plexVersion                     = "1.0.0"
@@ -4355,6 +4356,9 @@ func normalizePlexPublicRowsConfig(config plexPublicRowsConfig) plexPublicRowsCo
 	}
 	config.ItemLimit = boundedInt(strconv.Itoa(config.ItemLimit), plexPublicRowsDefaultItemLimit, 6, plexPublicRowsMaxItemLimit)
 	config.SelectedRows = uniqueNonEmptyStrings(config.SelectedRows)
+	if len(config.SelectedRows) == 0 {
+		config.Enabled = false
+	}
 	return config
 }
 
@@ -4401,7 +4405,8 @@ func (s *appState) plexPublicRowsDashboardSummary(ctx context.Context, config pl
 
 func (s *appState) plexPublicRowOptions(ctx context.Context, config plexPublicRowsConfig) ([]plexPublicRowOption, error) {
 	config = normalizePlexPublicRowsConfig(config)
-	cacheKey := "options:" + config.Section + ":" + strconv.Itoa(config.ItemLimit)
+	optionItemLimit := minInt(config.ItemLimit, plexPublicRowsChoiceItemLimit)
+	cacheKey := "options:" + config.Section + ":" + strconv.Itoa(optionItemLimit)
 	now := time.Now().UTC()
 
 	s.plexPublicRowsMu.RLock()
@@ -4416,7 +4421,7 @@ func (s *appState) plexPublicRowOptions(ctx context.Context, config plexPublicRo
 		return []plexPublicRowOption{}, fmt.Errorf("Plex account token is required")
 	}
 
-	hubs, err := s.fetchPlexDiscoverSectionHubs(ctx, token, config.Section, config.ItemLimit)
+	hubs, err := s.fetchPlexDiscoverSectionHubs(ctx, token, config.Section, optionItemLimit)
 	if err != nil {
 		return []plexPublicRowOption{}, err
 	}
