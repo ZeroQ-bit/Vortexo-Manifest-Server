@@ -291,3 +291,77 @@ func TestPlexArtworkSeedNeedsRefreshRepairsBackdropOnlyWithToken(t *testing.T) {
 		t.Fatalf("expected stale backdrop-only public artwork to be rechecked with Plex token")
 	}
 }
+
+func TestTMDBKeywordHomeItemUsesPublicTMDBRatingKeys(t *testing.T) {
+	show := tmdbKeywordHomeItem(tmdbDiscoverResult{
+		ID:           14658,
+		Name:         "Ghosts",
+		FirstAirDate: "2019-04-15",
+	}, "tv")
+	if show.RatingKey != "vortexo:tmdb:show:14658" {
+		t.Fatalf("expected public TMDB show rating key, got %q", show.RatingKey)
+	}
+	if show.ID != "tmdb:14658" || show.GUID != "tmdb://tv/14658" || show.MediaType != "tv" {
+		t.Fatalf("unexpected show home item identity: %#v", show)
+	}
+
+	movie := tmdbKeywordHomeItem(tmdbDiscoverResult{
+		ID:          1042834,
+		Title:       "Big",
+		ReleaseDate: "1988-06-03",
+	}, "movie")
+	if movie.RatingKey != "vortexo:tmdb:movie:1042834" {
+		t.Fatalf("expected public TMDB movie rating key, got %q", movie.RatingKey)
+	}
+	if movie.ID != "tmdb:1042834" || movie.GUID != "tmdb://movie/1042834" || movie.MediaType != "movie" {
+		t.Fatalf("unexpected movie home item identity: %#v", movie)
+	}
+}
+
+func TestVortexoStreamLookupIDsPreferIMDbAndIncludeTMDBFallbacks(t *testing.T) {
+	ids := vortexoStreamLookupIDs(vortexoSourcesRequest{
+		Type:   "episode",
+		TMDBID: 14658,
+		IMDBID: "https://www.imdb.com/title/tt8594324/",
+	}, "tt8594324")
+
+	want := []string{"tt8594324", "tmdb:14658", "14658"}
+	if len(ids) != len(want) {
+		t.Fatalf("expected %v, got %v", want, ids)
+	}
+	for i := range want {
+		if ids[i] != want[i] {
+			t.Fatalf("expected lookup id %d to be %q, got %q in %v", i, want[i], ids[i], ids)
+		}
+	}
+}
+
+func TestTMDBTVDetailsMapIncludesCountsAndImages(t *testing.T) {
+	details := tmdbTVDetailsMap(tmdbTVDetailsResponse{
+		ID:               14658,
+		Name:             "Ghosts",
+		Overview:         "A cash-strapped couple inherit a haunted house.",
+		PosterPath:       "/poster.jpg",
+		BackdropPath:     "/backdrop.jpg",
+		FirstAirDate:     "2019-04-15",
+		EpisodeRunTime:   []int{29},
+		NumberOfSeasons:  5,
+		NumberOfEpisodes: 34,
+		Genres:           []tmdbGenre{{Name: "Comedy"}, {Name: "Fantasy"}},
+		VoteAverage:      8.1,
+	})
+
+	if details["name"] != "Ghosts" || details["number_of_seasons"] != 5 || details["number_of_episodes"] != 34 {
+		t.Fatalf("unexpected TV details map: %#v", details)
+	}
+	if details["runtime"] != 29 {
+		t.Fatalf("expected episode runtime, got %#v", details["runtime"])
+	}
+	if details["poster_path"] != "https://image.tmdb.org/t/p/w500/poster.jpg" {
+		t.Fatalf("expected full poster URL, got %#v", details["poster_path"])
+	}
+	genres, ok := details["genres"].([]string)
+	if !ok || len(genres) != 2 || genres[0] != "Comedy" || genres[1] != "Fantasy" {
+		t.Fatalf("expected genre names, got %#v", details["genres"])
+	}
+}

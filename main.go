@@ -3559,6 +3559,81 @@ type tmdbDiscoverResult struct {
 	VoteAverage      float64 `json:"vote_average"`
 }
 
+type tmdbGenre struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+
+type tmdbExternalIDsResponse struct {
+	IMDBID string `json:"imdb_id"`
+}
+
+type tmdbMovieDetailsResponse struct {
+	ID               int         `json:"id"`
+	Title            string      `json:"title"`
+	OriginalTitle    string      `json:"original_title"`
+	Overview         string      `json:"overview"`
+	PosterPath       string      `json:"poster_path"`
+	BackdropPath     string      `json:"backdrop_path"`
+	ReleaseDate      string      `json:"release_date"`
+	Runtime          int         `json:"runtime"`
+	Genres           []tmdbGenre `json:"genres"`
+	VoteAverage      float64     `json:"vote_average"`
+	OriginalLanguage string      `json:"original_language"`
+	Status           string      `json:"status"`
+	Tagline          string      `json:"tagline"`
+}
+
+type tmdbTVDetailsResponse struct {
+	ID               int                  `json:"id"`
+	Name             string               `json:"name"`
+	OriginalName     string               `json:"original_name"`
+	Overview         string               `json:"overview"`
+	PosterPath       string               `json:"poster_path"`
+	BackdropPath     string               `json:"backdrop_path"`
+	FirstAirDate     string               `json:"first_air_date"`
+	EpisodeRunTime   []int                `json:"episode_run_time"`
+	NumberOfEpisodes int                  `json:"number_of_episodes"`
+	NumberOfSeasons  int                  `json:"number_of_seasons"`
+	Genres           []tmdbGenre          `json:"genres"`
+	VoteAverage      float64              `json:"vote_average"`
+	OriginalLanguage string               `json:"original_language"`
+	OriginCountry    []string             `json:"origin_country"`
+	Status           string               `json:"status"`
+	Tagline          string               `json:"tagline"`
+	Seasons          []tmdbTVSeasonResult `json:"seasons"`
+}
+
+type tmdbTVSeasonResult struct {
+	ID           int    `json:"id"`
+	Name         string `json:"name"`
+	Overview     string `json:"overview"`
+	PosterPath   string `json:"poster_path"`
+	AirDate      string `json:"air_date"`
+	SeasonNumber int    `json:"season_number"`
+	EpisodeCount int    `json:"episode_count"`
+}
+
+type tmdbTVSeasonDetailsResponse struct {
+	ID       int                 `json:"id"`
+	Name     string              `json:"name"`
+	Overview string              `json:"overview"`
+	Season   int                 `json:"season_number"`
+	Episodes []tmdbTVEpisodeItem `json:"episodes"`
+}
+
+type tmdbTVEpisodeItem struct {
+	ID            int     `json:"id"`
+	Name          string  `json:"name"`
+	Overview      string  `json:"overview"`
+	StillPath     string  `json:"still_path"`
+	AirDate       string  `json:"air_date"`
+	SeasonNumber  int     `json:"season_number"`
+	EpisodeNumber int     `json:"episode_number"`
+	Runtime       int     `json:"runtime"`
+	VoteAverage   float64 `json:"vote_average"`
+}
+
 func normalizeTMDBKeywordRowsConfig(config tmdbKeywordRowsConfig) tmdbKeywordRowsConfig {
 	config.TMDBAPIKey = strings.TrimSpace(config.TMDBAPIKey)
 	config.TMDBAccessToken = strings.TrimSpace(config.TMDBAccessToken)
@@ -3831,6 +3906,227 @@ func (s *appState) tmdbGetJSON(ctx context.Context, config tmdbKeywordRowsConfig
 	return json.Unmarshal(data, target)
 }
 
+func (s *appState) tmdbKeywordConfig() tmdbKeywordRowsConfig {
+	s.mu.RLock()
+	config := s.config.TMDBKeywordRows
+	s.mu.RUnlock()
+	return normalizeTMDBKeywordRowsConfig(config)
+}
+
+func (s *appState) tmdbMovieDetailsFromAPI(ctx context.Context, tmdbID int) (map[string]any, error) {
+	if tmdbID <= 0 {
+		return nil, fmt.Errorf("missing tmdb id")
+	}
+	var details tmdbMovieDetailsResponse
+	if err := s.tmdbGetJSON(ctx, s.tmdbKeywordConfig(), fmt.Sprintf("/3/movie/%d", tmdbID), nil, &details); err != nil {
+		return nil, err
+	}
+	return tmdbMovieDetailsMap(details), nil
+}
+
+func (s *appState) tmdbTVDetailsFromAPI(ctx context.Context, tmdbID int) (map[string]any, error) {
+	details, err := s.tmdbTVRawDetails(ctx, tmdbID)
+	if err != nil {
+		return nil, err
+	}
+	return tmdbTVDetailsMap(details), nil
+}
+
+func (s *appState) tmdbTVSeasonsFromAPI(ctx context.Context, tmdbID int) ([]map[string]any, error) {
+	details, err := s.tmdbTVRawDetails(ctx, tmdbID)
+	if err != nil {
+		return nil, err
+	}
+	seasons := details.Seasons
+	if len(seasons) == 0 && details.NumberOfSeasons > 0 {
+		seasons = make([]tmdbTVSeasonResult, 0, details.NumberOfSeasons)
+		for seasonNumber := 1; seasonNumber <= details.NumberOfSeasons; seasonNumber++ {
+			seasons = append(seasons, tmdbTVSeasonResult{SeasonNumber: seasonNumber})
+		}
+	}
+	out := make([]map[string]any, 0, len(seasons))
+	for _, season := range seasons {
+		if season.SeasonNumber < 0 {
+			continue
+		}
+		out = append(out, tmdbTVSeasonMap(season, details.Overview))
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return intFromAny(out[i]["season_number"]) < intFromAny(out[j]["season_number"])
+	})
+	return out, nil
+}
+
+func (s *appState) tmdbTVEpisodesFromAPI(ctx context.Context, tmdbID int) ([]map[string]any, error) {
+	details, err := s.tmdbTVRawDetails(ctx, tmdbID)
+	if err != nil {
+		return nil, err
+	}
+	seasons := details.Seasons
+	if len(seasons) == 0 && details.NumberOfSeasons > 0 {
+		seasons = make([]tmdbTVSeasonResult, 0, details.NumberOfSeasons)
+		for seasonNumber := 1; seasonNumber <= details.NumberOfSeasons; seasonNumber++ {
+			seasons = append(seasons, tmdbTVSeasonResult{SeasonNumber: seasonNumber})
+		}
+	}
+
+	config := s.tmdbKeywordConfig()
+	episodes := make([]map[string]any, 0, details.NumberOfEpisodes)
+	var lastErr error
+	for _, season := range seasons {
+		if season.SeasonNumber < 0 {
+			continue
+		}
+		var seasonDetails tmdbTVSeasonDetailsResponse
+		path := fmt.Sprintf("/3/tv/%d/season/%d", tmdbID, season.SeasonNumber)
+		if err := s.tmdbGetJSON(ctx, config, path, nil, &seasonDetails); err != nil {
+			lastErr = err
+			log.Printf("TMDB episodes failed for tv/%d season %d: %v", tmdbID, season.SeasonNumber, err)
+			continue
+		}
+		for _, episode := range seasonDetails.Episodes {
+			if episode.SeasonNumber == 0 {
+				episode.SeasonNumber = season.SeasonNumber
+			}
+			episodes = append(episodes, tmdbTVEpisodeMap(episode))
+		}
+	}
+	if len(episodes) == 0 && lastErr != nil {
+		return nil, lastErr
+	}
+	sort.SliceStable(episodes, func(i, j int) bool {
+		leftSeason := intFromAny(episodes[i]["season_number"])
+		rightSeason := intFromAny(episodes[j]["season_number"])
+		if leftSeason != rightSeason {
+			return leftSeason < rightSeason
+		}
+		return intFromAny(episodes[i]["episode_number"]) < intFromAny(episodes[j]["episode_number"])
+	})
+	return episodes, nil
+}
+
+func (s *appState) tmdbTVRawDetails(ctx context.Context, tmdbID int) (tmdbTVDetailsResponse, error) {
+	if tmdbID <= 0 {
+		return tmdbTVDetailsResponse{}, fmt.Errorf("missing tmdb id")
+	}
+	var details tmdbTVDetailsResponse
+	if err := s.tmdbGetJSON(ctx, s.tmdbKeywordConfig(), fmt.Sprintf("/3/tv/%d", tmdbID), nil, &details); err != nil {
+		return tmdbTVDetailsResponse{}, err
+	}
+	return details, nil
+}
+
+func (s *appState) tmdbIMDbID(ctx context.Context, vortexoType string, tmdbID int) (string, error) {
+	if tmdbID <= 0 {
+		return "", fmt.Errorf("missing tmdb id")
+	}
+	endpointType := "movie"
+	if normalizeVortexoType(vortexoType) == "episode" {
+		endpointType = "tv"
+	}
+	var response tmdbExternalIDsResponse
+	if err := s.tmdbGetJSON(ctx, s.tmdbKeywordConfig(), fmt.Sprintf("/3/%s/%d/external_ids", endpointType, tmdbID), nil, &response); err != nil {
+		return "", err
+	}
+	imdbID := imdbFromID(response.IMDBID)
+	if imdbID == "" {
+		return "", fmt.Errorf("TMDB %s/%d has no imdb id", endpointType, tmdbID)
+	}
+	return imdbID, nil
+}
+
+func tmdbMovieDetailsMap(details tmdbMovieDetailsResponse) map[string]any {
+	return map[string]any{
+		"id":                details.ID,
+		"title":             details.Title,
+		"overview":          details.Overview,
+		"poster_path":       tmdbImageURL(details.PosterPath, "w500"),
+		"backdrop_path":     tmdbImageURL(details.BackdropPath, "w1280"),
+		"poster_paths":      stringList(tmdbImageURL(details.PosterPath, "w500")),
+		"backdrop_paths":    stringList(tmdbImageURL(details.BackdropPath, "w1280")),
+		"landscape_paths":   stringList(tmdbImageURL(details.BackdropPath, "w780")),
+		"genres":            tmdbGenreNames(details.Genres),
+		"vote_average":      details.VoteAverage,
+		"runtime":           details.Runtime,
+		"release_date":      details.ReleaseDate,
+		"original_language": details.OriginalLanguage,
+		"status":            details.Status,
+		"tagline":           details.Tagline,
+	}
+}
+
+func tmdbTVDetailsMap(details tmdbTVDetailsResponse) map[string]any {
+	return map[string]any{
+		"id":                 details.ID,
+		"name":               details.Name,
+		"overview":           details.Overview,
+		"poster_path":        tmdbImageURL(details.PosterPath, "w500"),
+		"backdrop_path":      tmdbImageURL(details.BackdropPath, "w1280"),
+		"poster_paths":       stringList(tmdbImageURL(details.PosterPath, "w500")),
+		"backdrop_paths":     stringList(tmdbImageURL(details.BackdropPath, "w1280")),
+		"landscape_paths":    stringList(tmdbImageURL(details.BackdropPath, "w780")),
+		"genres":             tmdbGenreNames(details.Genres),
+		"vote_average":       details.VoteAverage,
+		"runtime":            firstInt(details.EpisodeRunTime),
+		"first_air_date":     details.FirstAirDate,
+		"number_of_seasons":  details.NumberOfSeasons,
+		"number_of_episodes": details.NumberOfEpisodes,
+		"original_language":  details.OriginalLanguage,
+		"origin_country":     details.OriginCountry,
+		"status":             details.Status,
+		"tagline":            details.Tagline,
+	}
+}
+
+func tmdbTVSeasonMap(season tmdbTVSeasonResult, fallbackOverview string) map[string]any {
+	seasonNumber := season.SeasonNumber
+	name := firstNonEmpty(season.Name, fmt.Sprintf("Season %d", seasonNumber))
+	if seasonNumber == 0 {
+		name = firstNonEmpty(season.Name, "Specials")
+	}
+	return map[string]any{
+		"id":            firstNonZero(season.ID, seasonNumber),
+		"season_number": seasonNumber,
+		"name":          name,
+		"overview":      firstNonEmpty(season.Overview, fallbackOverview),
+		"poster_path":   tmdbImageURL(season.PosterPath, "w500"),
+		"air_date":      season.AirDate,
+		"episode_count": season.EpisodeCount,
+	}
+}
+
+func tmdbTVEpisodeMap(episode tmdbTVEpisodeItem) map[string]any {
+	return map[string]any{
+		"id":             strconv.Itoa(episode.ID),
+		"tmdb_id":        episode.ID,
+		"title":          firstNonEmpty(episode.Name, fmt.Sprintf("Episode %d", episode.EpisodeNumber)),
+		"overview":       episode.Overview,
+		"still_path":     tmdbImageURL(episode.StillPath, "w780"),
+		"season_number":  episode.SeasonNumber,
+		"episode_number": episode.EpisodeNumber,
+		"runtime":        episode.Runtime,
+		"air_date":       episode.AirDate,
+		"vote_average":   episode.VoteAverage,
+	}
+}
+
+func tmdbGenreNames(genres []tmdbGenre) []string {
+	values := make([]string, 0, len(genres))
+	for _, genre := range genres {
+		values = append(values, genre.Name)
+	}
+	return uniqueNonEmptyStrings(values)
+}
+
+func firstInt(values []int) int {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
 func tmdbKeywordHomeItem(result tmdbDiscoverResult, endpointType string) vortexoHomeItem {
 	mediaType := "movie"
 	date := result.ReleaseDate
@@ -3848,7 +4144,7 @@ func tmdbKeywordHomeItem(result tmdbDiscoverResult, endpointType string) vortexo
 	}
 	return vortexoHomeItem{
 		ID:               id,
-		RatingKey:        "vortexo:" + ratingType + ":" + id,
+		RatingKey:        "vortexo:tmdb:" + ratingType + ":" + strconv.Itoa(tmdbID),
 		Key:              guid,
 		GUID:             guid,
 		MediaType:        mediaType,
@@ -5143,26 +5439,71 @@ func (s *appState) handleTMDBByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var tmdbAPIErr error
+	switch tail {
+	case "":
+		if routeMediaType == "tv" {
+			details, err := s.tmdbTVDetailsFromAPI(r.Context(), tmdbID)
+			if err == nil {
+				respondJSON(w, http.StatusOK, map[string]any{"details": details})
+				return
+			}
+			tmdbAPIErr = err
+		} else {
+			details, err := s.tmdbMovieDetailsFromAPI(r.Context(), tmdbID)
+			if err == nil {
+				respondJSON(w, http.StatusOK, map[string]any{"details": details})
+				return
+			}
+			tmdbAPIErr = err
+		}
+	case "seasons":
+		if routeMediaType != "tv" {
+			respondError(w, http.StatusNotFound, "tmdb seasons not found")
+			return
+		}
+		seasons, err := s.tmdbTVSeasonsFromAPI(r.Context(), tmdbID)
+		if err == nil {
+			respondJSON(w, http.StatusOK, map[string]any{"seasons": seasons})
+			return
+		}
+		tmdbAPIErr = err
+	case "episodes":
+		if routeMediaType != "tv" {
+			respondError(w, http.StatusNotFound, "tmdb episodes not found")
+			return
+		}
+		episodes, err := s.tmdbTVEpisodesFromAPI(r.Context(), tmdbID)
+		if err == nil {
+			respondJSON(w, http.StatusOK, map[string]any{"episodes": episodes})
+			return
+		}
+		tmdbAPIErr = err
+	default:
+		respondError(w, http.StatusNotFound, "tmdb endpoint not found")
+		return
+	}
+
 	if routeMediaType == "tv" {
 		switch tail {
 		case "":
 			details, err := s.tmdbTVDetailsFromPlexDiscover(r.Context(), tmdbID)
 			if err != nil {
-				respondError(w, http.StatusNotFound, fmt.Sprintf("%v; %v", manifestErr, err))
+				respondError(w, http.StatusNotFound, joinedErrorMessage(manifestErr, tmdbAPIErr, err))
 				return
 			}
 			respondJSON(w, http.StatusOK, map[string]any{"details": details})
 		case "seasons":
 			seasons, err := s.tmdbTVSeasonsFromPlexDiscover(r.Context(), tmdbID)
 			if err != nil {
-				respondError(w, http.StatusNotFound, fmt.Sprintf("%v; %v", manifestErr, err))
+				respondError(w, http.StatusNotFound, joinedErrorMessage(manifestErr, tmdbAPIErr, err))
 				return
 			}
 			respondJSON(w, http.StatusOK, map[string]any{"seasons": seasons})
 		case "episodes":
 			episodes, err := s.tmdbTVEpisodesFromPlexDiscover(r.Context(), tmdbID)
 			if err != nil {
-				respondError(w, http.StatusNotFound, fmt.Sprintf("%v; %v", manifestErr, err))
+				respondError(w, http.StatusNotFound, joinedErrorMessage(manifestErr, tmdbAPIErr, err))
 				return
 			}
 			respondJSON(w, http.StatusOK, map[string]any{"episodes": episodes})
@@ -5172,7 +5513,7 @@ func (s *appState) handleTMDBByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondError(w, http.StatusNotFound, manifestErr.Error())
+	respondError(w, http.StatusNotFound, joinedErrorMessage(manifestErr, tmdbAPIErr))
 }
 
 func normalizeTMDBRouteMediaType(value string) (routeMediaType string, stremioType string, ok bool) {
@@ -5862,8 +6203,8 @@ func (s *appState) handleVortexoSources(w http.ResponseWriter, r *http.Request) 
 		respondError(w, http.StatusBadRequest, "type must be movie or episode")
 		return
 	}
-	imdbID := strings.TrimSpace(req.IMDBID)
-	if imdbID == "" {
+	lookupIDs := s.vortexoStreamLookupIDs(r.Context(), req)
+	if len(lookupIDs) == 0 {
 		respondJSON(w, http.StatusOK, vortexoSourcesResponse{Matched: false, Available: false, Sources: []vortexoSource{}})
 		return
 	}
@@ -5875,22 +6216,28 @@ func (s *appState) handleVortexoSources(w http.ResponseWriter, r *http.Request) 
 		if err != nil || !manifestSupportsResource(manifest, "stream") {
 			continue
 		}
-		streams, err := s.fetchStreams(r.Context(), base, req, imdbID)
-		if err != nil {
-			log.Printf("streams %s failed: %v", item.URL, err)
-			continue
+		var lastErr error
+		for _, lookupID := range lookupIDs {
+			streams, err := s.fetchStreams(r.Context(), base, req, lookupID)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			for _, stream := range streams {
+				source, ok := vortexoSourceFromStream(stream, item.Name, req)
+				if !ok {
+					continue
+				}
+				key := firstNonEmpty(stream.URL, stream.ExternalURL, stream.InfoHash, source.FileName, source.Title)
+				if key == "" || seen[key] {
+					continue
+				}
+				seen[key] = true
+				all = append(all, source)
+			}
 		}
-		for _, stream := range streams {
-			source, ok := vortexoSourceFromStream(stream, item.Name, req)
-			if !ok {
-				continue
-			}
-			key := firstNonEmpty(stream.URL, stream.ExternalURL, stream.InfoHash, source.FileName, source.Title)
-			if key == "" || seen[key] {
-				continue
-			}
-			seen[key] = true
-			all = append(all, source)
+		if lastErr != nil && len(all) == 0 {
+			log.Printf("streams %s failed for ids %v: %v", item.URL, lookupIDs, lastErr)
 		}
 	}
 	sort.SliceStable(all, func(i, j int) bool {
@@ -5900,6 +6247,39 @@ func (s *appState) handleVortexoSources(w http.ResponseWriter, r *http.Request) 
 		return all[i].SizeGB > all[j].SizeGB
 	})
 	respondJSON(w, http.StatusOK, vortexoSourcesResponse{Matched: true, Available: len(all) > 0, Sources: all})
+}
+
+func (s *appState) vortexoStreamLookupIDs(ctx context.Context, req vortexoSourcesRequest) []string {
+	imdbID := imdbFromID(req.IMDBID)
+	if imdbID == "" && req.TMDBID > 0 {
+		resolved, err := s.tmdbIMDbID(ctx, req.Type, req.TMDBID)
+		if err != nil {
+			log.Printf("TMDB imdb lookup failed for %s tmdb:%d: %v", req.Type, req.TMDBID, err)
+		} else {
+			imdbID = resolved
+		}
+	}
+	return vortexoStreamLookupIDs(req, imdbID)
+}
+
+func vortexoStreamLookupIDs(req vortexoSourcesRequest, imdbID string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[strings.ToLower(value)] {
+			return
+		}
+		seen[strings.ToLower(value)] = true
+		out = append(out, value)
+	}
+	add(imdbFromID(imdbID))
+	if req.TMDBID > 0 {
+		tmdbID := strconv.Itoa(req.TMDBID)
+		add("tmdb:" + tmdbID)
+		add(tmdbID)
+	}
+	return out
 }
 
 func (s *appState) handleVortexoPlay(w http.ResponseWriter, r *http.Request) {
@@ -5975,13 +6355,13 @@ func (s *appState) handleVortexoSubtitles(w http.ResponseWriter, r *http.Request
 		respondError(w, http.StatusBadRequest, "type must be movie or episode")
 		return
 	}
-	imdbID := strings.TrimSpace(req.IMDBID)
-	if imdbID == "" {
-		respondError(w, http.StatusNotFound, "missing imdb id")
+	lookupIDs := s.vortexoStreamLookupIDs(r.Context(), req)
+	if len(lookupIDs) == 0 {
+		respondError(w, http.StatusNotFound, "missing media id")
 		return
 	}
 
-	subtitle, base, err := s.findSubtitle(r.Context(), req, imdbID, language)
+	subtitle, base, err := s.findSubtitle(r.Context(), req, lookupIDs, language)
 	if err != nil {
 		respondError(w, http.StatusNotFound, err.Error())
 		return
@@ -6211,7 +6591,7 @@ func (s *appState) fetchStreams(ctx context.Context, base string, req vortexoSou
 	return response.Streams, nil
 }
 
-func (s *appState) findSubtitle(ctx context.Context, req vortexoSourcesRequest, imdbID string, language string) (stremioSubtitle, string, error) {
+func (s *appState) findSubtitle(ctx context.Context, req vortexoSourcesRequest, lookupIDs []string, language string) (stremioSubtitle, string, error) {
 	aliases := subtitleLanguageAliasSet(language)
 	var lastErr error
 	for _, item := range s.enabledManifests() {
@@ -6223,19 +6603,23 @@ func (s *appState) findSubtitle(ctx context.Context, req vortexoSourcesRequest, 
 		if !manifestSupportsResource(manifest, "subtitles") || !manifestSupportsType(manifest, normalizeStremioTypeForVortexo(req.Type)) {
 			continue
 		}
-		subtitles, err := s.fetchSubtitles(ctx, base, req, imdbID)
-		if err != nil {
-			lastErr = err
-			log.Printf("subtitles %s failed: %v", item.URL, err)
-			continue
-		}
-		for _, subtitle := range subtitles {
-			if subtitle.URL == "" {
+		for _, lookupID := range lookupIDs {
+			subtitles, err := s.fetchSubtitles(ctx, base, req, lookupID)
+			if err != nil {
+				lastErr = err
 				continue
 			}
-			if subtitleMatchesLanguage(subtitle, aliases) {
-				return subtitle, base, nil
+			for _, subtitle := range subtitles {
+				if subtitle.URL == "" {
+					continue
+				}
+				if subtitleMatchesLanguage(subtitle, aliases) {
+					return subtitle, base, nil
+				}
 			}
+		}
+		if lastErr != nil {
+			log.Printf("subtitles %s failed for ids %v: %v", item.URL, lookupIDs, lastErr)
 		}
 	}
 	if lastErr != nil {
@@ -6244,15 +6628,15 @@ func (s *appState) findSubtitle(ctx context.Context, req vortexoSourcesRequest, 
 	return stremioSubtitle{}, "", fmt.Errorf("subtitle not found")
 }
 
-func (s *appState) fetchSubtitles(ctx context.Context, base string, req vortexoSourcesRequest, imdbID string) ([]stremioSubtitle, error) {
+func (s *appState) fetchSubtitles(ctx context.Context, base string, req vortexoSourcesRequest, lookupID string) ([]stremioSubtitle, error) {
 	var path string
 	if req.Type == "episode" {
 		if req.Season <= 0 || req.Episode <= 0 {
 			return nil, fmt.Errorf("season and episode are required")
 		}
-		path = fmt.Sprintf("subtitles/series/%s:%d:%d.json", url.PathEscape(imdbID), req.Season, req.Episode)
+		path = fmt.Sprintf("subtitles/series/%s:%d:%d.json", url.PathEscape(lookupID), req.Season, req.Episode)
 	} else {
-		path = fmt.Sprintf("subtitles/movie/%s.json", url.PathEscape(imdbID))
+		path = fmt.Sprintf("subtitles/movie/%s.json", url.PathEscape(lookupID))
 	}
 	u := strings.TrimRight(base, "/") + "/" + path
 	var response stremioSubtitleResponse
@@ -9810,6 +10194,26 @@ func respondJSON(w http.ResponseWriter, status int, value any) {
 
 func respondError(w http.ResponseWriter, status int, message string) {
 	respondJSON(w, status, map[string]any{"error": message, "message": message})
+}
+
+func joinedErrorMessage(errs ...error) string {
+	parts := make([]string, 0, len(errs))
+	seen := map[string]bool{}
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		message := strings.TrimSpace(err.Error())
+		if message == "" || seen[message] {
+			continue
+		}
+		seen[message] = true
+		parts = append(parts, message)
+	}
+	if len(parts) == 0 {
+		return "request failed"
+	}
+	return strings.Join(parts, "; ")
 }
 
 func firstNonEmpty(values ...string) string {
