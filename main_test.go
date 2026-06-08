@@ -366,56 +366,6 @@ func TestTMDBTVDetailsMapIncludesCountsAndImages(t *testing.T) {
 	}
 }
 
-func TestNormalizePlexPublicRowsConfigDefaultsAndClamps(t *testing.T) {
-	config := normalizePlexPublicRowsConfig(plexPublicRowsConfig{
-		Enabled:      true,
-		SelectedRows: []string{" row-a ", "row-a", "", "row-b"},
-		RowCount:     99,
-		ItemLimit:    2,
-		Section:      "bad-section",
-	})
-
-	if !config.Enabled {
-		t.Fatalf("expected enabled config")
-	}
-	if config.Section != "home" {
-		t.Fatalf("expected invalid section to normalize to home, got %q", config.Section)
-	}
-	if config.RowCount != plexPublicRowsMaxCount {
-		t.Fatalf("expected row count clamp, got %d", config.RowCount)
-	}
-	if config.ItemLimit != 6 {
-		t.Fatalf("expected item limit minimum, got %d", config.ItemLimit)
-	}
-	if len(config.SelectedRows) != 2 || config.SelectedRows[0] != "row-a" || config.SelectedRows[1] != "row-b" {
-		t.Fatalf("expected deduped selected rows, got %#v", config.SelectedRows)
-	}
-}
-
-func TestPlexPublicHomeItemFromDiscoverUsesTMDBPublicRatingKey(t *testing.T) {
-	item, ok := plexPublicHomeItemFromDiscover(plexDiscoverMetadata{
-		Type:                  "show",
-		Title:                 "Ghosts",
-		Summary:               "A haunted house comedy.",
-		OriginallyAvailableAt: "2019-04-15",
-		Thumb:                 "https://metadata-static.plex.tv/poster.jpg",
-		Art:                   "https://metadata-static.plex.tv/backdrop.jpg",
-		Guid: []plexDiscoverGuid{
-			{ID: "tmdb://tv/14658"},
-			{ID: "imdb://tt8594324"},
-		},
-	}, "")
-	if !ok {
-		t.Fatal("expected Plex Discover show to convert")
-	}
-	if item.RatingKey != "vortexo:tmdb:show:14658" || item.GUID != "tmdb://tv/14658" {
-		t.Fatalf("unexpected public TMDB identity: %#v", item)
-	}
-	if item.MediaType != "tv" || item.TMDBID != 14658 || item.IMDBID != "tt8594324" {
-		t.Fatalf("unexpected item ids: %#v", item)
-	}
-}
-
 func TestPlexDiscoverExternalIDsUsesLowercaseGuids(t *testing.T) {
 	tmdbID, imdbID := plexDiscoverExternalIDs(plexDiscoverMetadata{
 		Type: "movie",
@@ -447,35 +397,5 @@ func TestMergePlexDiscoverMetadataAddsPublicIDs(t *testing.T) {
 	}
 	if merged.Thumb != "https://metadata-static.plex.tv/original-poster.jpg" {
 		t.Fatalf("expected original artwork to be preserved, got %q", merged.Thumb)
-	}
-}
-
-func TestPlexPublicHomeRowFromHubFiltersUnplayableItems(t *testing.T) {
-	hub := plexDiscoverHub{
-		HubIdentifier: "popular-tv",
-		Title:         "Popular TV",
-		Metadata: []plexDiscoverMetadata{
-			{
-				Type:  "show",
-				Title: "Ghosts",
-				Guid:  []plexDiscoverGuid{{ID: "tmdb://tv/14658"}},
-			},
-			{
-				Type:  "person",
-				Title: "Actor",
-			},
-			{
-				Type:  "show",
-				Title: "No TMDB",
-			},
-		},
-	}
-
-	row := plexPublicHomeRowFromHub("home", hub, "", 24)
-	if row.ID == "" || row.Title != "Popular TV" || row.Reason != "Plex Discover" {
-		t.Fatalf("unexpected row metadata: %#v", row)
-	}
-	if len(row.Items) != 1 || row.Items[0].RatingKey != "vortexo:tmdb:show:14658" {
-		t.Fatalf("expected only TMDB-backed show item, got %#v", row.Items)
 	}
 }

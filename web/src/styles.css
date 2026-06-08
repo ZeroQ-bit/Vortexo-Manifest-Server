@@ -742,34 +742,6 @@ h3 {
   accent-color: #7dd3fc;
 }
 
-.plex-row-list {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-  margin-top: 14px;
-}
-
-.plex-row-choice {
-  min-height: 64px;
-  align-items: flex-start;
-}
-
-.plex-row-choice span {
-  min-width: 0;
-}
-
-.plex-row-choice strong,
-.plex-row-choice small {
-  display: block;
-}
-
-.plex-row-choice small {
-  margin-top: 4px;
-  color: #8fa0b5;
-  font-size: 12px;
-  font-weight: 700;
-}
-
 .wide-field {
   min-width: 0;
 }
@@ -917,7 +889,6 @@ h3 {
   .form-grid.registry-form,
   .choice-grid,
   .compact-choice-grid,
-  .plex-row-list,
   .preview-row,
   .catalog-row,
   .live-row {

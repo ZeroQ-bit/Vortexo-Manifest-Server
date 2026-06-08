@@ -82,21 +82,6 @@ const emptyDashboard = {
   registry_url: DEFAULT_REGISTRY_URL,
 };
 
-const emptyPlexPublicRows = {
-  enabled: false,
-  selectedRows: [],
-  rowCount: 8,
-  itemLimit: 24,
-  section: "home",
-  rows: [],
-  hasPlexToken: false,
-  error: "",
-  maxRowCount: 40,
-  maxItemLimit: 50,
-  defaultRowCount: 8,
-  defaultItemLimit: 24,
-};
-
 function App() {
   const [view, setView] = useState("overview");
   const [token, setToken] = useState(() => localStorage.getItem("vortexoToken") || "");
@@ -111,9 +96,6 @@ function App() {
   const [plexSettings, setPlexSettings] = useState({});
   const [plexAccessToken, setPlexAccessToken] = useState("");
   const [plexStatus, setPlexStatus] = useState("");
-  const [plexPublicRows, setPlexPublicRows] = useState(emptyPlexPublicRows);
-  const [plexPublicRowsStatus, setPlexPublicRowsStatus] = useState("");
-  const [plexPublicRowsBusy, setPlexPublicRowsBusy] = useState(false);
   const [plexPin, setPlexPin] = useState(() => {
     const id = Number(localStorage.getItem("vortexoPlexPinID") || 0);
     return id > 0 ? { id } : null;
@@ -214,12 +196,6 @@ function App() {
       region: config.region || current.region || "US",
     }));
   }, [dashboard.tmdb_keyword_rows]);
-
-  useEffect(() => {
-    const config = dashboard.plex_public_rows;
-    if (!config) return;
-    setPlexPublicRows((current) => mergePlexPublicRowsState(current, config));
-  }, [dashboard.plex_public_rows]);
 
   useEffect(() => {
     if (signedIn && view === "discover" && registryAddons.length === 0 && !registryLoading) {
@@ -611,66 +587,6 @@ function App() {
     }
   }
 
-  async function loadPlexPublicRows(overrides = {}) {
-    if (!token) return;
-    const section = overrides.section || plexPublicRows.section || "home";
-    const itemLimit = overrides.itemLimit || plexPublicRows.itemLimit || emptyPlexPublicRows.itemLimit;
-    const params = new URLSearchParams();
-    params.set("section", section);
-    params.set("item_limit", String(itemLimit));
-    params.set("refresh", "1");
-    setPlexPublicRowsBusy(true);
-    setPlexPublicRowsStatus("Loading Plex row choices...");
-    try {
-      const data = await request(`/api/v1/bridge/plex-public-rows?${params.toString()}`);
-      setPlexPublicRows((current) => mergePlexPublicRowsState(current, data));
-      const rowTotal = (data.rows || []).length;
-      setPlexPublicRowsStatus(data.error || (rowTotal > 0 ? `Loaded ${rowTotal} Plex row choices.` : "No Plex row choices loaded."));
-      await loadDashboard();
-    } catch (error) {
-      setMessage(error.message);
-      setPlexPublicRowsStatus(error.message);
-    } finally {
-      setPlexPublicRowsBusy(false);
-    }
-  }
-
-  async function savePlexPublicRows(event) {
-    event.preventDefault();
-    if (plexPublicRows.enabled && !plexPublicRows.hasPlexToken && !plexSettings?.has_access_token) {
-      setPlexPublicRowsStatus("Plex account token is required.");
-      return;
-    }
-    if (plexPublicRows.enabled && (plexPublicRows.selectedRows || []).length === 0) {
-      setPlexPublicRowsStatus("Select at least one Plex row to publish.");
-      return;
-    }
-    setBusy(true);
-    setPlexPublicRowsStatus("Saving Plex public rows...");
-    try {
-      const data = await request("/api/v1/bridge/plex-public-rows", {
-        method: "POST",
-        body: JSON.stringify({
-          enabled: plexPublicRows.enabled,
-          selected_rows: plexPublicRows.selectedRows || [],
-          row_count: Number(plexPublicRows.rowCount) || emptyPlexPublicRows.rowCount,
-          item_limit: Number(plexPublicRows.itemLimit) || emptyPlexPublicRows.itemLimit,
-          section: plexPublicRows.section || "home",
-        }),
-      });
-      setPlexPublicRows((current) => mergePlexPublicRowsState(current, data));
-      setMessage(plexPublicRows.enabled ? "Plex public rows saved" : "Plex public rows disabled");
-      setPlexPublicRowsStatus(data.error || "Plex public rows saved.");
-      await loadDashboard();
-      await loadPublicHome();
-    } catch (error) {
-      setMessage(error.message);
-      setPlexPublicRowsStatus(error.message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
   async function saveWatch(event) {
     event.preventDefault();
     setBusy(true);
@@ -771,7 +687,7 @@ function App() {
       setPlexAccessToken("");
       await loadDashboard();
       setMessage("Plex connected");
-      setPlexStatus("Plex connected. Discover landscapes and public rows can now use this account.");
+      setPlexStatus("Plex connected. Discover landscapes can now use this account.");
     } catch (error) {
       setMessage(error.message);
       setPlexStatus(error.message);
@@ -792,7 +708,6 @@ function App() {
       setPlexAccessToken("");
       setPlexPin(null);
       localStorage.removeItem("vortexoPlexPinID");
-      setPlexPublicRows(emptyPlexPublicRows);
       await loadDashboard();
       await loadPublicHome();
       setMessage("Plex disconnected");
@@ -843,7 +758,7 @@ function App() {
       localStorage.removeItem("vortexoPlexPinID");
       await loadDashboard();
       setMessage("Plex connected");
-      setPlexStatus("Plex connected. Discover landscapes and public rows can now use this account.");
+      setPlexStatus("Plex connected. Discover landscapes can now use this account.");
     } catch (error) {
       setMessage(error.message);
       setPlexStatus(error.message);
@@ -999,17 +914,11 @@ function App() {
                 setPlexAccessToken={setPlexAccessToken}
                 plexPin={plexPin}
                 plexStatus={plexStatus}
-                plexPublicRows={plexPublicRows}
-                setPlexPublicRows={setPlexPublicRows}
-                plexPublicRowsStatus={plexPublicRowsStatus}
-                plexPublicRowsBusy={plexPublicRowsBusy}
                 onSavePlex={savePlexToken}
                 onClearPlex={clearPlexToken}
                 onStartPlex={startPlexLogin}
                 onCheckPlex={checkPlexLogin}
                 onRefreshArtwork={refreshArtwork}
-                onLoadPlexPublicRows={loadPlexPublicRows}
-                onSavePlexPublicRows={savePlexPublicRows}
                 busy={busy}
               />
             )}
@@ -1643,17 +1552,11 @@ function WatchSync({
   setPlexAccessToken,
   plexPin,
   plexStatus,
-  plexPublicRows,
-  setPlexPublicRows,
-  plexPublicRowsStatus,
-  plexPublicRowsBusy,
   onSavePlex,
   onClearPlex,
   onStartPlex,
   onCheckPlex,
   onRefreshArtwork,
-  onLoadPlexPublicRows,
-  onSavePlexPublicRows,
   busy,
 }) {
   const hasTraktConfig = Boolean(watch.trakt_client_config || form.traktClientId.trim());
@@ -1664,11 +1567,6 @@ function WatchSync({
   const plexName = plex?.username || plex?.title || plex?.email || "";
   const plexLink = plexPin?.authorization_url || plexPin?.verification_url || "https://plex.tv/link";
   const artworkGaps = (artwork?.miss || 0) + (artwork?.error || 0);
-  const hasPlexToken = Boolean(plexPublicRows?.hasPlexToken || plex?.has_access_token);
-  const plexRows = plexPublicRows?.rows || [];
-  const selectedPlexRows = plexPublicRows?.selectedRows || [];
-  const plexRowCountOptions = uniqueOptions([plexPublicRows?.rowCount || 8, 4, 8, 12, 20, 30, 40].filter((count) => count <= (plexPublicRows?.maxRowCount || 40)));
-  const plexItemLimitOptions = uniqueOptions([plexPublicRows?.itemLimit || 24, 12, 24].filter((count) => count <= (plexPublicRows?.maxItemLimit || 24)));
   return (
     <section className="stack">
       <div className="metric-grid two-cols">
@@ -1742,98 +1640,6 @@ function WatchSync({
           </div>
         )}
         {plexStatus && <div className={isErrorMessage(plexStatus) ? "inline-error" : "inline-note"}>{plexStatus}</div>}
-      </form>
-
-      <form className="panel" onSubmit={onSavePlexPublicRows}>
-        <div className="section-head">
-          <div>
-            <p className="eyebrow">Native Home</p>
-            <h2>Plex public rows</h2>
-            <p className="muted">
-              {hasPlexToken
-                ? `${plexRows.length} selectable hub${plexRows.length === 1 ? "" : "s"} loaded from Plex Discover.`
-                : "Connect Plex above to load public hub rows."}
-            </p>
-          </div>
-          <span className={plexPublicRows?.enabled ? "small-status ok" : hasPlexToken ? "small-status" : "small-status warn"}>
-            {plexPublicRows?.enabled ? "Enabled" : hasPlexToken ? "Ready" : "Missing Plex"}
-          </span>
-        </div>
-
-        <div className="form-grid four">
-          <div className="choice-block">
-            <span>Status</span>
-            <div className="choice-grid single-choice-grid">
-              <label className={plexPublicRows?.enabled ? "choice-chip selected" : "choice-chip"}>
-                <input
-                  type="checkbox"
-                  checked={Boolean(plexPublicRows?.enabled)}
-                  onChange={() => setPlexPublicRows({ ...plexPublicRows, enabled: !plexPublicRows?.enabled })}
-                />
-                Publish selected rows
-              </label>
-            </div>
-          </div>
-          <SelectField
-            label="Hub section"
-            value={plexPublicRows?.section || "home"}
-            onChange={(value) => setPlexPublicRows({ ...plexPublicRows, section: value, selectedRows: [], rows: [] })}
-            options={[
-              ["home", "Home"],
-              ["watchlist", "Watchlist"],
-            ]}
-          />
-          <SelectField
-            label="Maximum rows"
-            value={String(plexPublicRows?.rowCount || 8)}
-            onChange={(value) => setPlexPublicRows({ ...plexPublicRows, rowCount: Number(value) })}
-            options={plexRowCountOptions.map((count) => [String(count), `${count} Rows`])}
-          />
-          <SelectField
-            label="Items per row"
-            value={String(plexPublicRows?.itemLimit || 24)}
-            onChange={(value) => setPlexPublicRows({ ...plexPublicRows, itemLimit: Number(value), rows: [] })}
-            options={plexItemLimitOptions.map((count) => [String(count), `${count} Items`])}
-          />
-        </div>
-
-        {!hasPlexToken ? (
-          <EmptyState icon={Library} title="Plex account needed" text="Use Plex PIN Login or paste a token in the card above." />
-        ) : plexPublicRows?.error ? (
-          <div className="inline-error">{plexPublicRows.error}</div>
-        ) : plexRows.length === 0 ? (
-          <EmptyState icon={RefreshCw} title="No rows loaded" text="Refresh row choices after selecting a hub section." />
-        ) : (
-          <div className="plex-row-list">
-            {plexRows.map((row) => {
-              const checked = selectedPlexRows.includes(row.id);
-              return (
-                <label className={checked ? "choice-chip plex-row-choice selected" : "choice-chip plex-row-choice"} key={row.id}>
-                  <input
-                    type="checkbox"
-                    checked={checked}
-                    onChange={() => setPlexPublicRows({
-                      ...plexPublicRows,
-                      selectedRows: toggleArrayValue(selectedPlexRows, row.id),
-                    })}
-                  />
-                  <span>
-                    <strong>{row.title || row.id}</strong>
-                    <small>{row.source || "Plex Discover"} · {row.item_count || 0} playable items</small>
-                  </span>
-                </label>
-              );
-            })}
-          </div>
-        )}
-
-        <div className="form-actions">
-          <button type="button" className="secondary" onClick={() => onLoadPlexPublicRows()} disabled={plexPublicRowsBusy || !hasPlexToken}>
-            {plexPublicRowsBusy ? "Loading Rows" : "Refresh Row Choices"}
-          </button>
-          <button type="submit" disabled={busy || (plexPublicRows?.enabled && (!hasPlexToken || selectedPlexRows.length === 0))}>Save Plex Rows</button>
-        </div>
-        {plexPublicRowsStatus && <div className={isErrorMessage(plexPublicRowsStatus) ? "inline-error" : "inline-note"}>{plexPublicRowsStatus}</div>}
       </form>
     </section>
   );
@@ -1983,24 +1789,6 @@ function sortedCatalogs(catalogs) {
     if (left !== right) return left - right;
     return String(a.name || a.id).localeCompare(String(b.name || b.id));
   });
-}
-
-function mergePlexPublicRowsState(current, data = {}) {
-  return {
-    ...current,
-    enabled: Boolean(data.enabled),
-    selectedRows: Array.isArray(data.selected_rows) ? data.selected_rows : current.selectedRows || [],
-    rowCount: data.row_count || data.default_row_count || current.rowCount || emptyPlexPublicRows.rowCount,
-    itemLimit: data.item_limit || data.default_item_limit || current.itemLimit || emptyPlexPublicRows.itemLimit,
-    section: data.section || current.section || "home",
-    rows: Array.isArray(data.rows) ? data.rows : current.rows || [],
-    hasPlexToken: Boolean(data.has_plex_token),
-    error: data.error || "",
-    maxRowCount: data.max_row_count || current.maxRowCount || emptyPlexPublicRows.maxRowCount,
-    maxItemLimit: data.max_item_limit || current.maxItemLimit || emptyPlexPublicRows.maxItemLimit,
-    defaultRowCount: data.default_row_count || current.defaultRowCount || emptyPlexPublicRows.defaultRowCount,
-    defaultItemLimit: data.default_item_limit || current.defaultItemLimit || emptyPlexPublicRows.defaultItemLimit,
-  };
 }
 
 function uniqueOptions(values) {
