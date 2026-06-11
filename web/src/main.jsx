@@ -580,6 +580,42 @@ function AppContent() {
     ]
   );
 
+  const saveCatalogRows = useCallback(
+    async (catalogDrafts) => {
+      if (!token) {
+        setMessage("Sign in to save catalog rows.");
+        return;
+      }
+      setBusy(true);
+      try {
+        const data = await request("/api/v1/bridge/catalogs", {
+          method: "POST",
+          body: JSON.stringify({
+            catalogs: catalogDrafts.map((catalog) => ({
+              key: catalog.key,
+              manifest_id: catalog.manifest_id,
+              catalog_type: catalog.catalog_type,
+              catalog_id: catalog.catalog_id,
+              name: catalog.name,
+              enabled: Boolean(catalog.enabled),
+              sort_order: Number(catalog.sort_order) || 0,
+            })),
+          }),
+        });
+        setDashboard((current) => ({
+          ...current,
+          catalogs: data.catalogs || current.catalogs || [],
+        }));
+        setMessage("Catalog row settings saved.");
+      } catch (error) {
+        setMessage(error.message);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [token, request, setDashboard, setMessage]
+  );
+
   const saveWatchSettings = useCallback(
     async () => {
       if (!token) {
@@ -1000,7 +1036,11 @@ function AppContent() {
               />
             )}
             {view === "catalogs" && (
-              <Catalogs catalogs={dashboard.catalogs || []} busy={busy} />
+              <Catalogs
+                catalogs={dashboard.catalogs || []}
+                busy={busy}
+                onSave={saveCatalogRows}
+              />
             )}
             {view === "live" && (
               <LiveTV rows={liveRows} summary={summary} />
@@ -1546,11 +1586,33 @@ function Addons({ manifests, manual, setManual, onInstall, onUpdate, onRemove, b
   );
 }
 
-function Catalogs({ catalogs, busy }) {
+function Catalogs({ catalogs, busy, onSave }) {
   const sorted = sortedCatalogs(catalogs || []);
+  const [drafts, setDrafts] = useState(() =>
+    sorted.map(catalogToPreferenceDraft)
+  );
+
+  useEffect(() => {
+    setDrafts(sortedCatalogs(catalogs || []).map(catalogToPreferenceDraft));
+  }, [catalogs]);
+
+  const updateDraft = (key, patch) => {
+    setDrafts((current) =>
+      current.map((draft) =>
+        draft.key === key ? { ...draft, ...patch } : draft
+      )
+    );
+  };
+  const draftByKey = new Map(drafts.map((draft) => [draft.key, draft]));
 
   return (
-    <section className="panel">
+    <form
+      className="panel compact-form"
+      onSubmit={(event) => {
+        event.preventDefault();
+        onSave(drafts);
+      }}
+    >
       <div className="section-head">
         <div>
           <p className="eyebrow">Catalog manager</p>
@@ -1565,32 +1627,79 @@ function Catalogs({ catalogs, busy }) {
           text="Install a catalog-capable add-on to see rows here."
         />
       ) : (
-        <div className="catalog-list managed">
-          {sorted.map((catalog) => (
-            <div
-              className={
-                catalog.enabled === false ? "catalog-row disabled" : "catalog-row"
-              }
-              key={catalog.key}
-            >
-              <div>
-                <strong>{catalog.original_name || catalog.id}</strong>
-                <span>{catalog.manifest_name}</span>
-              </div>
-              <div className="chip-row tight">
-                <span className="chip">{catalog.type}</span>
-                {catalog.search && <span className="chip">Search</span>}
-                {catalog.required_extras?.map((extra) => (
-                  <span className="chip amber" key={extra}>
-                    {extra}
-                  </span>
-                ))}
-              </div>
-            </div>
-          ))}
-        </div>
+        <>
+          <div className="catalog-list managed editable">
+            {sorted.map((catalog) => {
+              const draft = draftByKey.get(catalog.key) || catalogToPreferenceDraft(catalog);
+              return (
+                <div
+                  className={
+                    draft.enabled === false ? "catalog-row disabled" : "catalog-row"
+                  }
+                  key={catalog.key}
+                >
+                  <div>
+                    <strong>{catalog.original_name || catalog.id}</strong>
+                    <span>{catalog.manifest_name}</span>
+                    <div className="chip-row compact-tags">
+                      <span className="chip">{catalog.type}</span>
+                      {catalog.search && <span className="chip">Search</span>}
+                      {catalog.required_extras?.map((extra) => (
+                        <span className="chip amber" key={extra}>
+                          {extra}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="catalog-edit-fields">
+                    <label className="toggle-line compact-toggle">
+                      <input
+                        type="checkbox"
+                        checked={draft.enabled !== false}
+                        onChange={(event) =>
+                          updateDraft(draft.key, { enabled: event.target.checked })
+                        }
+                      />
+                      <span>Enabled</span>
+                    </label>
+                    <label>
+                      <span>Display name</span>
+                      <input
+                        value={draft.name}
+                        placeholder={catalog.original_name || catalog.id}
+                        onChange={(event) =>
+                          updateDraft(draft.key, { name: event.target.value })
+                        }
+                      />
+                    </label>
+                    <label>
+                      <span>Order</span>
+                      <input
+                        type="number"
+                        value={draft.sort_order}
+                        onChange={(event) =>
+                          updateDraft(draft.key, {
+                            sort_order: Number(event.target.value) || 0,
+                          })
+                        }
+                      />
+                    </label>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="form-actions">
+            <button type="submit" disabled={busy}>
+              {busy ? "Saving..." : "Save catalog row settings"}
+            </button>
+            <span className="small-status muted-chip">
+              {drafts.filter((draft) => draft.enabled !== false).length} enabled
+            </span>
+          </div>
+        </>
       )}
-    </section>
+    </form>
   );
 }
 
@@ -1861,8 +1970,7 @@ function Setup({
             <h2>TMDB keyword rows</h2>
           </div>
         </div>
-        <label>
-          <span>Enable keyword rows</span>
+        <label className="toggle-line">
           <input
             type="checkbox"
             checked={Boolean(keywordRows.enabled)}
@@ -1873,6 +1981,7 @@ function Setup({
               })
             }
           />
+          <span>Enable keyword rows</span>
         </label>
         <div className="form-grid three">
           <label>
@@ -1932,8 +2041,7 @@ function Setup({
             placeholder="tmdb access token"
             help="Alternative to API key for TMDB requests."
           />
-          <label>
-            <span>Clear saved TMDB credentials</span>
+          <label className="toggle-line field-toggle">
             <input
               type="checkbox"
               checked={Boolean(keywordRows.clearCredentials)}
@@ -1944,6 +2052,7 @@ function Setup({
                 })
               }
             />
+            <span>Clear saved TMDB credentials</span>
           </label>
         </div>
         <div className="form-actions">
@@ -2363,6 +2472,23 @@ function sortedCatalogs(catalogs) {
     if (left !== right) return left - right;
     return String(a.name || a.id).localeCompare(String(b.name || b.id));
   });
+}
+
+function catalogToPreferenceDraft(catalog) {
+  const key = catalog.key || [
+    catalog.manifest_id,
+    catalog.type,
+    catalog.id,
+  ].filter(Boolean).join("|");
+  return {
+    key,
+    manifest_id: catalog.manifest_id || "",
+    catalog_type: catalog.type || "",
+    catalog_id: catalog.id || "",
+    name: catalog.name || catalog.original_name || catalog.id || "",
+    enabled: catalog.enabled !== false,
+    sort_order: Number.isFinite(catalog.sort_order) ? catalog.sort_order : 0,
+  };
 }
 
 function toggleArrayValue(values, value) {
