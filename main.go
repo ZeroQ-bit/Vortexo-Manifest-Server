@@ -1983,6 +1983,10 @@ func (s *appState) handleVortexoWatchState(w http.ResponseWriter, r *http.Reques
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	limit := watchStateQueryInt(r, "limit", 0)
+	if limit <= 0 {
+		limit = watchStateQueryInt(r, "item_limit", 0)
+	}
 	s.mu.RLock()
 	state := s.watchState
 	if state.Items == nil {
@@ -1991,11 +1995,56 @@ func (s *appState) handleVortexoWatchState(w http.ResponseWriter, r *http.Reques
 		state.Items = append([]watchStateItem(nil), state.Items...)
 	}
 	s.mu.RUnlock()
+	if limit > 0 && len(state.Items) > limit {
+		state.Items = limitedWatchStateItems(state.Items, limit)
+	}
 	state.Items = s.enrichWatchStateWithManifestMetadata(r.Context(), state.Items)
 	for i := range state.Items {
 		s.applyCachedPlexArtworkToWatchStateItem(&state.Items[i])
 	}
 	respondJSON(w, http.StatusOK, state)
+}
+
+func watchStateQueryInt(r *http.Request, key string, fallback int) int {
+	raw := strings.TrimSpace(r.URL.Query().Get(key))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return value
+}
+
+func limitedWatchStateItems(items []watchStateItem, limit int) []watchStateItem {
+	if limit <= 0 || len(items) <= limit {
+		return items
+	}
+	sortedItems := append([]watchStateItem(nil), items...)
+	sort.SliceStable(sortedItems, func(i, j int) bool {
+		return sortedItems[i].UpdatedAt.After(sortedItems[j].UpdatedAt)
+	})
+
+	limited := make([]watchStateItem, 0, limit)
+	addMatching := func(include func(watchStateItem) bool) {
+		for _, item := range sortedItems {
+			if len(limited) >= limit {
+				return
+			}
+			if include(item) {
+				limited = append(limited, item)
+			}
+		}
+	}
+
+	addMatching(func(item watchStateItem) bool {
+		return !item.Watched || item.ProgressPercent > 0 || item.ProgressSeconds > 0
+	})
+	addMatching(func(item watchStateItem) bool {
+		return item.Watched && item.ProgressPercent <= 0 && item.ProgressSeconds <= 0
+	})
+	return limited
 }
 
 func (s *appState) handleVortexoWatchStateMark(w http.ResponseWriter, r *http.Request) {
