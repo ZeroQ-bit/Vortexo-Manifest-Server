@@ -62,6 +62,7 @@ const (
 
 var srtTimestampPattern = regexp.MustCompile(`(\d{2}:\d{2}:\d{2}),(\d{3})`)
 var justWatchPosterPattern = regexp.MustCompile(`/poster/([0-9]+)/`)
+var traktAtomEpisodePattern = regexp.MustCompile(`/shows/([^/]+)/seasons/([0-9]+)/episodes/([0-9]+)`)
 
 type appState struct {
 	mu                       sync.RWMutex
@@ -122,6 +123,7 @@ type traktWatchConfig struct {
 	ClientSecret   string    `json:"client_secret,omitempty"`
 	AccessToken    string    `json:"access_token,omitempty"`
 	RefreshToken   string    `json:"refresh_token,omitempty"`
+	UpNextAtomURL  string    `json:"up_next_atom_url,omitempty"`
 	TokenExpiresAt time.Time `json:"token_expires_at,omitempty"`
 	LastSyncAt     time.Time `json:"last_sync_at,omitempty"`
 }
@@ -1050,11 +1052,12 @@ func (a plexArtwork) isEmpty() bool {
 }
 
 type watchSettingsRequest struct {
-	TraktClientID     string `json:"trakt_client_id"`
-	TraktClientSecret string `json:"trakt_client_secret"`
-	TraktAccessToken  string `json:"trakt_access_token"`
-	TraktRefreshToken string `json:"trakt_refresh_token"`
-	ClearTraktTokens  bool   `json:"clear_trakt_tokens"`
+	TraktClientID      string `json:"trakt_client_id"`
+	TraktClientSecret  string `json:"trakt_client_secret"`
+	TraktAccessToken   string `json:"trakt_access_token"`
+	TraktRefreshToken  string `json:"trakt_refresh_token"`
+	TraktUpNextAtomURL string `json:"trakt_up_next_atom_url"`
+	ClearTraktTokens   bool   `json:"clear_trakt_tokens"`
 }
 
 type traktDeviceCodeRequest struct {
@@ -1190,6 +1193,19 @@ type traktShowProgress struct {
 	Completed     int           `json:"completed"`
 	LastWatchedAt time.Time     `json:"last_watched_at"`
 	NextEpisode   *traktEpisode `json:"next_episode"`
+}
+
+type traktUpNextAtomFeed struct {
+	Entries []traktUpNextAtomEntry `xml:"entry"`
+}
+
+type traktUpNextAtomEntry struct {
+	Title string                `xml:"title"`
+	Links []traktUpNextAtomLink `xml:"link"`
+}
+
+type traktUpNextAtomLink struct {
+	Href string `xml:"href,attr"`
 }
 
 func main() {
@@ -1707,6 +1723,7 @@ func (s *appState) handleWatchSettings(w http.ResponseWriter, r *http.Request) {
 				"has_client_secret": watch.Trakt.ClientSecret != "",
 				"has_access_token":  watch.Trakt.AccessToken != "",
 				"has_refresh_token": watch.Trakt.RefreshToken != "",
+				"up_next_atom_url":  watch.Trakt.UpNextAtomURL,
 				"token_expires_at":  watch.Trakt.TokenExpiresAt,
 				"last_sync_at":      watch.Trakt.LastSyncAt,
 			},
@@ -1728,6 +1745,7 @@ func (s *appState) handleWatchSettings(w http.ResponseWriter, r *http.Request) {
 		if strings.TrimSpace(req.TraktClientSecret) != "" {
 			s.config.Watch.Trakt.ClientSecret = strings.TrimSpace(req.TraktClientSecret)
 		}
+		s.config.Watch.Trakt.UpNextAtomURL = strings.TrimSpace(req.TraktUpNextAtomURL)
 		if req.ClearTraktTokens {
 			s.config.Watch.Trakt.AccessToken = ""
 			s.config.Watch.Trakt.RefreshToken = ""
@@ -6138,6 +6156,9 @@ func (s *appState) syncTraktWatchState(ctx context.Context) ([]watchStateItem, e
 	}
 
 	upNextEpisodes := s.traktUpNextWatchItems(ctx, watchedShows)
+	if atomOrder := s.traktUpNextAtomOrder(ctx); len(atomOrder) > 0 {
+		applyTraktUpNextAtomOrder(upNextEpisodes, atomOrder)
+	}
 
 	items := make([]watchStateItem, 0, len(watchedMovies)+len(playbackMovies)+len(playbackEpisodes)+len(upNextEpisodes))
 	for _, entry := range watchedMovies {
@@ -6231,6 +6252,116 @@ func (s *appState) traktUpNextWatchItems(ctx context.Context, watchedShows []tra
 		items = append(items, item)
 	}
 	return items
+}
+
+func (s *appState) traktUpNextAtomOrder(ctx context.Context) map[string]int {
+	s.mu.RLock()
+	feedURL := strings.TrimSpace(s.config.Watch.Trakt.UpNextAtomURL)
+	s.mu.RUnlock()
+	if feedURL == "" {
+		return nil
+	}
+	parsedURL, err := url.Parse(feedURL)
+	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+		log.Printf("Trakt up next atom order skipped: invalid feed URL")
+		return nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, feedURL, nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		log.Printf("Trakt up next atom order skipped: %v", err)
+		return nil
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("Trakt up next atom order skipped: HTTP %d %s", resp.StatusCode, responseMessage(data))
+		return nil
+	}
+	var feed traktUpNextAtomFeed
+	if err := xml.Unmarshal(data, &feed); err != nil {
+		log.Printf("Trakt up next atom order skipped: %v", err)
+		return nil
+	}
+	order := make(map[string]int, len(feed.Entries))
+	for index, entry := range feed.Entries {
+		for _, link := range entry.Links {
+			match := traktAtomEpisodePattern.FindStringSubmatch(link.Href)
+			if len(match) != 4 {
+				continue
+			}
+			season, seasonErr := strconv.Atoi(match[2])
+			episode, episodeErr := strconv.Atoi(match[3])
+			if seasonErr != nil || episodeErr != nil {
+				continue
+			}
+			key := traktAtomOrderKey(match[1], season, episode)
+			if key != "" {
+				if _, exists := order[key]; !exists {
+					order[key] = index
+				}
+				break
+			}
+		}
+	}
+	return order
+}
+
+func applyTraktUpNextAtomOrder(items []watchStateItem, order map[string]int) {
+	if len(items) == 0 || len(order) == 0 {
+		return
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		iOrder, iOK := order[watchStateAtomOrderKey(items[i])]
+		jOrder, jOK := order[watchStateAtomOrderKey(items[j])]
+		if iOK != jOK {
+			return iOK
+		}
+		if iOK && iOrder != jOrder {
+			return iOrder < jOrder
+		}
+		return items[i].UpdatedAt.After(items[j].UpdatedAt)
+	})
+	now := time.Now().UTC()
+	for index := range items {
+		if _, ok := order[watchStateAtomOrderKey(items[index])]; ok {
+			items[index].UpdatedAt = now.Add(-time.Duration(index) * time.Second)
+		}
+	}
+}
+
+func watchStateAtomOrderKey(item watchStateItem) string {
+	showSlug := firstNonEmpty(item.SourceUserID, slugForAtomOrder(item.ParentTitle))
+	return traktAtomOrderKey(showSlug, item.Season, item.Episode)
+}
+
+func traktAtomOrderKey(showSlug string, season int, episode int) string {
+	showSlug = strings.TrimSpace(strings.ToLower(showSlug))
+	if showSlug == "" || season <= 0 || episode <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d:%d", showSlug, season, episode)
+}
+
+func slugForAtomOrder(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var builder strings.Builder
+	lastDash := false
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			builder.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			builder.WriteByte('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(builder.String(), "-")
 }
 
 func (s *appState) traktGetJSON(ctx context.Context, path string, target any) error {
@@ -10049,6 +10180,7 @@ func watchItemFromTraktEpisode(show traktShow, episode traktEpisode, watched boo
 func watchItemFromTraktUpNextEpisode(show traktShow, episode traktEpisode, updatedAt time.Time) watchStateItem {
 	item := watchItemFromTraktEpisode(show, episode, false, updatedAt, 0, 0)
 	item.Source = "trakt-up-next"
+	item.SourceUserID = strings.TrimSpace(show.IDs.Slug)
 	item.Watched = false
 	item.WatchedAt = time.Time{}
 	item.ProgressPercent = 0

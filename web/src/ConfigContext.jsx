@@ -70,6 +70,7 @@ export function ConfigProvider({ children }) {
     traktClientSecret: '',
     traktAccessToken: '',
     traktRefreshToken: '',
+    traktUpNextAtomUrl: '',
   });
 
   // Data loaded from endpoints

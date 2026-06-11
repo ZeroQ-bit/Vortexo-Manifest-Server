@@ -232,6 +232,7 @@ function AppContent() {
         setWatchForm((current) => ({
           ...current,
           traktClientId: data.trakt?.client_id || "",
+          traktUpNextAtomUrl: data.trakt?.up_next_atom_url || "",
         }));
         const watchState = data.watch_state || {};
         const watchCount = watchState.count || 0;
@@ -660,6 +661,7 @@ function AppContent() {
             trakt_client_secret: watchForm.traktClientSecret,
             trakt_access_token: watchForm.traktAccessToken,
             trakt_refresh_token: watchForm.traktRefreshToken,
+            trakt_up_next_atom_url: watchForm.traktUpNextAtomUrl,
           }),
         });
         setWatchForm((current) => ({
@@ -2199,6 +2201,13 @@ function WatchSync({
           label="Refresh Token (optional)"
           value={form.traktRefreshToken}
           onChange={(value) => setForm({ ...form, traktRefreshToken: value })}
+        />
+        <TextField
+          label="Up Next Atom URL (optional)"
+          value={form.traktUpNextAtomUrl}
+          onChange={(value) => setForm({ ...form, traktUpNextAtomUrl: value })}
+          placeholder="https://trakt.tv/users/.../progress/watched/added/asc.atom?..."
+          help="Optional. Used only by this server to match Trakt's Up Next order."
         />
         <div className="form-actions">
           <button type="submit" disabled={busy}>
