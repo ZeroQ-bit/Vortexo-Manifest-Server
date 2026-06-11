@@ -1278,7 +1278,12 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/vortexo/capabilities", s.handleCapabilities)
 	mux.HandleFunc("/api/v1/vortexo/home", s.handleVortexoHome)
 	mux.HandleFunc("/api/v1/vortexo/live-tv/rows", s.handleVortexoLiveTVRows)
-	mux.HandleFunc("/api/v1/vortexo/watch-state", s.requireAuth(s.handleVortexoWatchState))
+	if publicWatchStateEnabled() {
+		log.Printf("Watch-state endpoint exposed without server auth")
+		mux.HandleFunc("/api/v1/vortexo/watch-state", s.handleVortexoWatchState)
+	} else {
+		mux.HandleFunc("/api/v1/vortexo/watch-state", s.requireAuth(s.handleVortexoWatchState))
+	}
 	mux.HandleFunc("/api/v1/vortexo/watch-state/mark", s.requireAuth(s.handleVortexoWatchStateMark))
 	mux.HandleFunc("/api/v1/vortexo/sources", s.handleVortexoSources)
 	mux.HandleFunc("/api/v1/vortexo/play/", s.handleVortexoPlay)
@@ -1287,6 +1292,15 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/player_api.php", s.handleXtreamPlayerAPI)
 	mux.HandleFunc("/xmltv.php", s.handleXMLTV)
 	mux.HandleFunc("/live/", s.handleLivePlayback)
+}
+
+func publicWatchStateEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("VORTEXO_PUBLIC_WATCH_STATE"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *appState) load() error {

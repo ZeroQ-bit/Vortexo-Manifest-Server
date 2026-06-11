@@ -152,6 +152,7 @@ Back up this folder if you want to keep installed manifests, credentials, watch 
 | `VORTEXO_DATA_DIR` | `/data` | Directory for persistent server data. |
 | `VORTEXO_ADMIN_USERNAME` | `vortexo` | Admin username used on first run. |
 | `VORTEXO_ADMIN_PASSWORD` | `vortexo` | Admin password used on first run. |
+| `VORTEXO_PUBLIC_WATCH_STATE` | `false` | Set to `true`, `1`, `yes`, or `on` to expose `/api/v1/vortexo/watch-state` without server authentication. |
 | `PORT` | unset | Alternative port variable. Used only if `VORTEXO_LISTEN_ADDR` is not set. |
 | `DATA_DIR` | unset | Alternative data directory variable. Used only if `VORTEXO_DATA_DIR` is not set. |
 
