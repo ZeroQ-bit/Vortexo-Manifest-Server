@@ -103,6 +103,8 @@ function AppContent() {
     setHomeRows,
     liveRows,
     setLiveRows,
+    continueWatchingItems,
+    setContinueWatchingItems,
     registryAddons,
     setRegistryAddons,
     plexSettings,
@@ -172,6 +174,32 @@ function AppContent() {
     }
   }, []);
 
+  const loadContinueWatchingItems = useCallback(
+    async (activeToken = token) => {
+      if (!activeToken) {
+        setContinueWatchingItems([]);
+        return;
+      }
+      try {
+        const res = await fetch("/api/v1/vortexo/watch-state?limit=30", {
+          headers: { authorization: `Bearer ${activeToken}` },
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.message || "Watch-state failed");
+        const items = Array.isArray(data.items) ? data.items : [];
+        setContinueWatchingItems(
+          items
+            .filter((item) => !item.watched || item.progress_percent > 0 || item.progress_seconds > 0)
+            .sort((a, b) => Number(isTraktUpNextItem(b)) - Number(isTraktUpNextItem(a)))
+            .slice(0, 12)
+        );
+      } catch {
+        setContinueWatchingItems([]);
+      }
+    },
+    [token, setContinueWatchingItems]
+  );
+
   const loadDashboard = useCallback(
     async (activeToken = token) => {
       if (!activeToken) return;
@@ -212,11 +240,12 @@ function AppContent() {
             data.trakt?.has_access_token ? "saved" : "missing"
           }`
         );
+        await loadContinueWatchingItems(activeToken);
       } catch {
         // Optional panel; keep the dashboard usable.
       }
     },
-    [token]
+    [token, loadContinueWatchingItems]
   );
 
   const loadPlexSettings = useCallback(
@@ -771,14 +800,14 @@ function AppContent() {
             data.total || 0
           }.`
         );
-        await loadWatchSettings();
+        await Promise.all([loadWatchSettings(), loadContinueWatchingItems()]);
       } catch (error) {
         setWatchStatus(error.message);
       } finally {
         setBusy(false);
       }
     },
-    [token, request, loadWatchSettings, setWatchStatus]
+    [token, request, loadWatchSettings, loadContinueWatchingItems, setWatchStatus]
   );
 
   const clearWatchHistory = useCallback(
@@ -793,6 +822,7 @@ function AppContent() {
           method: "DELETE",
         });
         setWatchStatus(`Watch history cleared (${data.removed || 0} removed).`);
+        setContinueWatchingItems([]);
         await loadWatchSettings();
       } catch (error) {
         setWatchStatus(error.message);
@@ -800,7 +830,7 @@ function AppContent() {
         setBusy(false);
       }
     },
-    [token, request, loadWatchSettings, setWatchStatus]
+    [token, request, loadWatchSettings, setContinueWatchingItems, setWatchStatus]
   );
 
   const savePlexSettings = useCallback(
@@ -1063,6 +1093,7 @@ function AppContent() {
                 form={watchForm}
                 setForm={setWatchForm}
                 status={watchStatus}
+                continueWatchingItems={continueWatchingItems}
                 plex={plexSettings}
                 artwork={dashboard.artwork || {}}
                 plexAccessToken={plexAccessToken}
@@ -1078,6 +1109,7 @@ function AppContent() {
                 onCheckTraktLogin={checkTraktDeviceLogin}
                 onSyncTrakt={syncTraktWatch}
                 onClearWatchHistory={clearWatchHistory}
+                onRefreshContinueWatching={loadContinueWatchingItems}
                 onSavePlexSettings={savePlexSettings}
                 onClearPlexSettings={clearPlexSettings}
                 onStartPlexLogin={startPlexLogin}
@@ -2078,6 +2110,7 @@ function WatchSync({
   form,
   setForm,
   status,
+  continueWatchingItems = [],
   plex,
   artwork,
   plexAccessToken,
@@ -2093,6 +2126,7 @@ function WatchSync({
   onCheckTraktLogin,
   onSyncTrakt,
   onClearWatchHistory,
+  onRefreshContinueWatching,
   onSavePlexSettings,
   onClearPlexSettings,
   onStartPlexLogin,
@@ -2232,6 +2266,52 @@ function WatchSync({
           </div>
         )}
       </form>
+
+      <div className="panel compact-form">
+        <div className="section-head">
+          <div>
+            <p className="eyebrow">Trakt preview</p>
+            <h2>Up Next / Continue Watching</h2>
+          </div>
+          <button
+            type="button"
+            className="secondary compact-button"
+            onClick={onRefreshContinueWatching}
+            disabled={busy}
+          >
+            Refresh row
+          </button>
+        </div>
+        {continueWatchingItems.length ? (
+          <div className="watch-preview-list">
+            {continueWatchingItems.map((item) => (
+              <div className="watch-preview-row" key={watchPreviewKey(item)}>
+                <div className="watch-preview-poster">
+                  {imageForItem(item) ? (
+                    <img src={imageForItem(item)} alt="" loading="lazy" />
+                  ) : (
+                    <Play size={18} />
+                  )}
+                </div>
+                <div className="watch-preview-copy">
+                  <strong>{watchPreviewTitle(item)}</strong>
+                  <span>{watchPreviewSubtitle(item)}</span>
+                </div>
+                <div className="watch-preview-meta">
+                  <span>{watchPreviewProgress(item)}</span>
+                  <small>{item.source || "watch-state"}</small>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <EmptyState
+            icon={Activity}
+            title="No Up Next items loaded"
+            text="Sync Trakt history or refresh this row to preview what Vortexo will use for Continue Watching."
+          />
+        )}
+      </div>
 
       <form
         className="panel compact-form"
@@ -2417,6 +2497,54 @@ function SelectField({ label, value, onChange, options }) {
 }
 
 // ============ HELPER FUNCTIONS ============
+function watchPreviewKey(item) {
+  return [
+    item?.id,
+    item?.media_type,
+    item?.tmdb_id,
+    item?.imdb_id,
+    item?.season,
+    item?.episode,
+    item?.title,
+  ]
+    .filter(Boolean)
+    .join(":");
+}
+
+function isTraktUpNextItem(item) {
+  return String(item?.source || "").toLowerCase().includes("trakt-up-next");
+}
+
+function watchPreviewTitle(item) {
+  return item?.title || item?.parent_title || "Untitled";
+}
+
+function watchPreviewSubtitle(item) {
+  const parts = [];
+  if (item?.parent_title && item.parent_title !== item.title) {
+    parts.push(item.parent_title);
+  }
+  if (item?.season && item?.episode) {
+    parts.push(`S${item.season} E${item.episode}`);
+  } else if (item?.year) {
+    parts.push(String(item.year));
+  }
+  if (item?.media_type) {
+    parts.push(item.media_type);
+  }
+  return parts.join(" · ") || "Synced watch-state item";
+}
+
+function watchPreviewProgress(item) {
+  if (item?.progress_percent > 0) {
+    return `${Math.round(item.progress_percent)}%`;
+  }
+  if (item?.progress_seconds > 0) {
+    return `${Math.round(item.progress_seconds / 60)} min`;
+  }
+  return item?.watched ? "Watched" : "Up next";
+}
+
 function pageTitle(view) {
   return {
     overview: "Dashboard",

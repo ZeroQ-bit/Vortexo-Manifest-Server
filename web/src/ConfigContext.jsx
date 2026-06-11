@@ -75,6 +75,7 @@ export function ConfigProvider({ children }) {
   // Data loaded from endpoints
   const [homeRows, setHomeRows] = useState([]);
   const [liveRows, setLiveRows] = useState([]);
+  const [continueWatchingItems, setContinueWatchingItems] = useState([]);
   const [registryAddons, setRegistryAddons] = useState([]);
   const [plexSettings, setPlexSettings] = useState({});
   const [plexPin, setPlexPin] = useState(null);
@@ -112,6 +113,7 @@ export function ConfigProvider({ children }) {
     setDashboard(emptyDashboard);
     setHomeRows([]);
     setLiveRows([]);
+    setContinueWatchingItems([]);
     setRegistryAddons([]);
     setPlexSettings({});
     setWatchStatus('');
@@ -149,6 +151,8 @@ export function ConfigProvider({ children }) {
       setHomeRows,
       liveRows,
       setLiveRows,
+      continueWatchingItems,
+      setContinueWatchingItems,
       registryAddons,
       setRegistryAddons,
       plexSettings,
@@ -164,7 +168,7 @@ export function ConfigProvider({ children }) {
       plexStatus,
       setPlexStatus,
     }),
-    [token, signedIn, serverUrl, dashboard, resetDashboard, summary, view, message, busy, login, registry, perfect, streamingCatalogs, keywordRows, watchForm, homeRows, liveRows, registryAddons, plexSettings, plexPin, plexAccessToken, watchStatus, registryLoading, plexStatus]
+    [token, signedIn, serverUrl, dashboard, resetDashboard, summary, view, message, busy, login, registry, perfect, streamingCatalogs, keywordRows, watchForm, homeRows, liveRows, continueWatchingItems, registryAddons, plexSettings, plexPin, plexAccessToken, watchStatus, registryLoading, plexStatus]
   );
 
   return (

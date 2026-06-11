@@ -2039,7 +2039,11 @@ func limitedWatchStateItems(items []watchStateItem, limit int) []watchStateItem 
 	}
 
 	addMatching(func(item watchStateItem) bool {
-		return !item.Watched || item.ProgressPercent > 0 || item.ProgressSeconds > 0
+		return strings.Contains(strings.ToLower(item.Source), "trakt-up-next")
+	})
+	addMatching(func(item watchStateItem) bool {
+		return !strings.Contains(strings.ToLower(item.Source), "trakt-up-next") &&
+			(!item.Watched || item.ProgressPercent > 0 || item.ProgressSeconds > 0)
 	})
 	addMatching(func(item watchStateItem) bool {
 		return item.Watched && item.ProgressPercent <= 0 && item.ProgressSeconds <= 0
